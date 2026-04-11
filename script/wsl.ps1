@@ -19,7 +19,8 @@ $forcePull = $ForcePull.IsPresent
 
 # ── WSL distro ──
 
-$archiveHash = & $sha256 "$baseArchive-$toolArchive-$claudeArchive"
+$distroSrc = (& $imageSrc) + [IO.File]::ReadAllText("$projectRoot\config\wsl.conf")
+$archiveHash = & $sha256 "$baseArchive-$toolArchive-$claudeArchive-$distroSrc-$Image"
 $workdirHash = & $sha256 $PWD.Path
 $distroName = "claude-$workdirHash"
 $distroDir = "$env:LocalAppData\$distroName"

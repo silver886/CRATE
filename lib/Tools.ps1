@@ -16,13 +16,26 @@ $cacheDir = if ($env:XDG_CACHE_HOME) { "$env:XDG_CACHE_HOME\claude-code-sandbox"
 $toolsDir = "$cacheDir\tools"
 
 $detectArch = {
-  # Windows podman runs containers/WSL in x64 Linux — hardcode for now
-  $script:archNode = 'x64'
-  $script:archRg = 'x86_64-unknown-linux-musl'
-  $script:archMicro = 'linux64-static'
-  $script:archUv = 'x86_64-unknown-linux-musl'
-  $script:archPnpm = 'linux-x64'
-  $script:archClaude = 'linux-x64'
+  $osArch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+  switch ($osArch) {
+    'X64' {
+      $script:archNode = 'x64'
+      $script:archRg = 'x86_64-unknown-linux-musl'
+      $script:archMicro = 'linux64-static'
+      $script:archUv = 'x86_64-unknown-linux-musl'
+      $script:archPnpm = 'linux-x64'
+      $script:archClaude = 'linux-x64'
+    }
+    'Arm64' {
+      $script:archNode = 'arm64'
+      $script:archRg = 'aarch64-unknown-linux-gnu'
+      $script:archMicro = 'linux-arm64'
+      $script:archUv = 'aarch64-unknown-linux-musl'
+      $script:archPnpm = 'linux-arm64'
+      $script:archClaude = 'linux-arm64'
+    }
+    default { throw "Unsupported architecture: $osArch" }
+  }
 }
 
 $fetchToolVersions = {
