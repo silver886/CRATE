@@ -1,22 +1,28 @@
 #!/bin/sh
 # setup-tools.sh — extract tool archives and set up the claude binary.
-# Usage: setup-tools.sh [--exec] <archive.tar.xz>...
+# Usage: setup-tools.sh [--exec] [--log-level I|W|E] <archive.tar.xz>...
 #
 # Extracts each archive into CLAUDE_BIN_DIR (default: $HOME/.local/bin),
 # makes all files executable, then renames the claude binary so the
 # shell wrapper (claude-wrapper.sh) can take over the "claude" name.
 #
 # With --exec, launches claude --dangerously-skip-permissions after setup.
+#
+# --log-level is passed through to the wrapper under --exec and
+# controls our own logger threshold for the extract/done lines.
+# LOG_LEVEL is never read from env — every caller passes it as an arg.
 set -eu
 
 # Inline structured logger — same format, threshold, and color
-# semantics as lib/log.sh. $LOG_LEVEL inherited from the parent
-# launcher. Colors disabled when $NO_COLOR is set or stderr is not
-# a tty (piped/captured), so log files never get escape bytes.
+# semantics as lib/log.sh. $LOG_LEVEL is a local shell var only, set
+# by --log-level parsing below. Colors disabled when $NO_COLOR is set
+# or stderr is not a tty, so log files never get escape bytes.
 if [ -z "${NO_COLOR:-}" ] && [ -t 2 ]; then _LOG_C=1; else _LOG_C=; fi
 log() {
-  _t=2; case "${LOG_LEVEL:-W}" in I) _t=1 ;; E) _t=3 ;; esac
-  _m=1; case "$1"               in W) _m=2 ;; E) _m=3 ;; esac
+  _ll=${LOG_LEVEL:-W}
+  case "$_ll" in i) _ll=I ;; w) _ll=W ;; e) _ll=E ;; esac
+  _t=2; case "$_ll" in I) _t=1 ;; E) _t=3 ;; esac
+  _m=1; case "$1"   in W) _m=2 ;; E) _m=3 ;; esac
   [ "$_m" -lt "$_t" ] && return 0
   if [ -n "$_LOG_C" ]; then
     case "$1" in
@@ -33,14 +39,31 @@ log() {
 }
 
 LAUNCH=""
-if [ "${1:-}" = "--exec" ]; then
-  LAUNCH=1; shift
-fi
+_ARCHIVES=""
+_ARCHIVE_COUNT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --exec) LAUNCH=1; shift ;;
+    --log-level)
+      case "${2:-}" in
+        I|i) LOG_LEVEL=I ;;
+        W|w) LOG_LEVEL=W ;;
+        E|e) LOG_LEVEL=E ;;
+        *) log E archive arg-parse "invalid --log-level: ${2:-} (want I, W, or E)"; exit 1 ;;
+      esac
+      shift 2
+      ;;
+    *) _ARCHIVES="$_ARCHIVES $1"; _ARCHIVE_COUNT=$((_ARCHIVE_COUNT + 1)); shift ;;
+  esac
+done
+: "${LOG_LEVEL:=W}"
 
 BIN_DIR="${CLAUDE_BIN_DIR:-$HOME/.local/bin}"
-log I archive extract "$BIN_DIR ($# archives)"
+log I archive extract "$BIN_DIR ($_ARCHIVE_COUNT archives)"
 mkdir -p "$BIN_DIR"
-for archive in "$@"; do
+# Unquoted expansion intentional: $_ARCHIVES is a space-separated list
+# of archive paths (all under the cache dir, no spaces in practice).
+for archive in $_ARCHIVES; do
   tar -xJf "$archive" -C "$BIN_DIR/"
 done
 # Only chmod the known set extracted from the three tool archives —
@@ -54,6 +77,6 @@ mv "$BIN_DIR/claude-wrapper" "$BIN_DIR/claude"
 log I archive done "$BIN_DIR"
 
 if [ -n "$LAUNCH" ]; then
-  log I run launch "$BIN_DIR/claude --dangerously-skip-permissions"
-  exec "$BIN_DIR/claude" --dangerously-skip-permissions
+  log I run launch "$BIN_DIR/claude --log-level $LOG_LEVEL --dangerously-skip-permissions"
+  exec "$BIN_DIR/claude" --log-level "$LOG_LEVEL" --dangerously-skip-permissions
 fi

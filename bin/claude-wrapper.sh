@@ -1,13 +1,17 @@
 #!/bin/sh
 
 # Inline structured logger — same format, threshold, and color
-# semantics as lib/log.sh. $LOG_LEVEL inherited from the launcher's
-# container env. Colors disabled when $NO_COLOR is set or stderr is
-# not a tty, so log files never get escape bytes.
+# semantics as lib/log.sh. $LOG_LEVEL is NOT inherited from env; it
+# is set by --log-level parsing below. Colors disabled when $NO_COLOR
+# is set or stderr is not a tty, so log files never get escape bytes.
 if [ -z "${NO_COLOR:-}" ] && [ -t 2 ]; then _LOG_C=1; else _LOG_C=; fi
 log() {
-  _t=2; case "${LOG_LEVEL:-W}" in I) _t=1 ;; E) _t=3 ;; esac
-  _m=1; case "$1"               in W) _m=2 ;; E) _m=3 ;; esac
+  # Normalize LOG_LEVEL to uppercase so a stray lowercase value doesn't
+  # silently fall through to the default W threshold and hide I logs.
+  _ll=${LOG_LEVEL:-W}
+  case "$_ll" in i) _ll=I ;; w) _ll=W ;; e) _ll=E ;; esac
+  _t=2; case "$_ll" in I) _t=1 ;; E) _t=3 ;; esac
+  _m=1; case "$1"   in W) _m=2 ;; E) _m=3 ;; esac
   [ "$_m" -lt "$_t" ] && return 0
   if [ -n "$_LOG_C" ]; then
     case "$1" in
@@ -23,12 +27,27 @@ log() {
   fi
 }
 
+# Parse --log-level off the front of the arg list before forwarding
+# the rest to claude. We don't read LOG_LEVEL from env at all: every
+# launcher passes the level as an explicit `--log-level X` arg so no
+# env var ever leaks across a process boundary or into claude itself.
+if [ "${1:-}" = "--log-level" ]; then
+  case "${2:-}" in
+    I|i) LOG_LEVEL=I ;;
+    W|w) LOG_LEVEL=W ;;
+    E|e) LOG_LEVEL=E ;;
+    *) log E run arg-parse "invalid --log-level: ${2:-} (want I, W, or E)"; exit 1 ;;
+  esac
+  shift 2
+fi
+: "${LOG_LEVEL:=W}"
+
 if [ -x /usr/local/lib/claude-code-sandbox/enable-dnf ]; then
   # Pass log level as an explicit arg rather than a preserved env
   # var. Fedora sudoers `env_check` blocks unknown env vars even
   # with --preserve-env=, and adding LOG_LEVEL to env_keep would
   # widen the bootstrap sudoers rule unnecessarily.
-  _DNF_LVL="--log-level ${LOG_LEVEL:-W}"
+  _DNF_LVL="--log-level $LOG_LEVEL"
   if [ -n "${CLAUDE_ENABLE_DNF:-}" ]; then
     sudo /usr/local/lib/claude-code-sandbox/enable-dnf $_DNF_LVL --yes --purge
   else

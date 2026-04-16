@@ -36,6 +36,12 @@ function Invoke-Must {
 # cache, baked-in script paths). UNC and \\wsl$ paths never appear.
 $wslSrc = { param($p)
   $abs = [IO.Path]::GetFullPath($p)
+  # Validate: must be a drive-letter path (C:\…). UNC paths (\\server\…,
+  # \\wsl$\…) would silently produce nonsense like /mnt/\/server/… and
+  # bind the wrong location. Fail loud instead.
+  if ($abs.Length -lt 3 -or $abs[1] -ne ':') {
+    throw "wslSrc: non-drive-letter path not supported: $abs"
+  }
   '/mnt/' + $abs.Substring(0, 1).ToLower() + $abs.Substring(2).Replace('\', '/')
 }
 

@@ -64,20 +64,18 @@ fi
 
 # Threshold filtering reads `$LOG_LEVEL` as a plain shell variable
 # (not an env var) — it lives in the launcher process and dies with
-# it. Child processes that need to inherit the level get LOG_LEVEL
-# injected explicitly at the boundary call site:
+# it. LOG_LEVEL is NEVER exported as an env var or passed via
+# `--env` / `env VAR=…`. Every process boundary uses an explicit
+# `--log-level X` arg so the env is never polluted:
 #
-#   ensure-credential.sh   LOG_LEVEL=$LOG_LEVEL ./lib/ensure-credential.sh
-#   podman container       podman run --env LOG_LEVEL=$LOG_LEVEL …
-#   podman machine ssh     ssh "export LOG_LEVEL=$LOG_LEVEL && cmd"
-#   wsl -u root            wsl … env LOG_LEVEL=$LOG_LEVEL cmd
-#   sudo (in sandbox)      sudo --preserve-env=LOG_LEVEL cmd  (env set by podman --env)
+#   ensure-credential.sh   ./lib/ensure-credential.sh --log-level $LOG_LEVEL
+#   podman container       setup-tools.sh parses --log-level from CMD tail
+#   podman machine ssh     /tmp/setup-tools.sh --log-level $LOG_LEVEL …
+#   wsl -u root            sh $wslSetup --log-level $LogLevel …
+#   sudo (in sandbox)      enable-dnf.sh --log-level $LOG_LEVEL
 #
-# The bin/* in-sandbox scripts read LOG_LEVEL from their *process
-# environment* (delivered by podman --env / wsl env / sudo
-# --preserve-env). That's the correct transport at the boundary and
-# avoids touching the launcher's env so the host shell is never
-# polluted.
+# Each bin/* script parses --log-level into its own local LOG_LEVEL
+# shell var for the inline logger. No env var inheritance is involved.
 #
 # Levels:
 #   LOG_LEVEL=I   show everything (verbose; opt-in)
@@ -89,7 +87,12 @@ fi
 
 # log <lvl> <stage> <event> <message>
 log() {
-  _t=2; case "${LOG_LEVEL:-W}" in I) _t=1 ;; E) _t=3 ;; esac
+  # Normalize to uppercase so a stray lowercase value doesn't silently
+  # fall through to the default W threshold. Matches the inline loggers
+  # in bin/*.sh which do the same normalization.
+  _ll=${LOG_LEVEL:-W}
+  case "$_ll" in i) _ll=I ;; w) _ll=W ;; e) _ll=E ;; esac
+  _t=2; case "$_ll" in I) _t=1 ;; E) _t=3 ;; esac
   _m=1; case "$1"               in W) _m=2 ;; E) _m=3 ;; esac
   [ "$_m" -lt "$_t" ] && return 0
   if [ -n "$_LOG_C" ]; then

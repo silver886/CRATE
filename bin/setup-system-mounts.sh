@@ -16,6 +16,10 @@
 #                        canonical $CONFIG_DIR/<f> on every launch.
 #   --ro-files    "..." space-separated ro file basenames (from $RO_FILES)
 #   --ro-dirs     "..." space-separated ro dir  basenames (from $RO_DIRS)
+#   --log-level   I|W|E  log threshold. Passed as an arg (not env) because
+#                        sudo env_check strips unknown LOG_LEVEL values on
+#                        Fedora CoreOS even with --preserve-env=LOG_LEVEL.
+#                        Same rationale as bin/enable-dnf.sh.
 #
 # Assembly steps (in order — see plan doc for the vfkit rationale):
 #   1. mkdir target
@@ -31,13 +35,19 @@
 set -eu
 
 # Inline structured logger — same format, threshold, and color
-# semantics as lib/log.sh. $LOG_LEVEL inherited from the parent
-# launcher. Colors disabled when $NO_COLOR is set or stderr is not
-# a tty (piped/captured), so log files never get escape bytes.
+# semantics as lib/log.sh. $LOG_LEVEL is set from --log-level arg
+# parsing below; never inherited from env. Colors disabled when
+# $NO_COLOR is set or stderr is not a tty, so log files never get
+# escape bytes.
 if [ -z "${NO_COLOR:-}" ] && [ -t 2 ]; then _LOG_C=1; else _LOG_C=; fi
 log() {
-  _t=2; case "${LOG_LEVEL:-W}" in I) _t=1 ;; E) _t=3 ;; esac
-  _m=1; case "$1"               in W) _m=2 ;; E) _m=3 ;; esac
+  # Normalize LOG_LEVEL to uppercase so `LOG_LEVEL=i` from env (or any
+  # future path that forgets to normalize upstream) doesn't silently
+  # fall through to the default W threshold and hide I-level logs.
+  _ll=${LOG_LEVEL:-W}
+  case "$_ll" in i) _ll=I ;; w) _ll=W ;; e) _ll=E ;; esac
+  _t=2; case "$_ll" in I) _t=1 ;; E) _t=3 ;; esac
+  _m=1; case "$1"   in W) _m=2 ;; E) _m=3 ;; esac
   [ "$_m" -lt "$_t" ] && return 0
   if [ -n "$_LOG_C" ]; then
     case "$1" in
@@ -65,9 +75,22 @@ while [ $# -gt 0 ]; do
     --config-files) CONFIG_FILES="$2"; shift 2 ;;
     --ro-files)     RO_FILES="$2"; shift 2 ;;
     --ro-dirs)      RO_DIRS="$2"; shift 2 ;;
+    --log-level)
+      # Accept any case and normalize. Downstream consumers (the inline
+      # logger above) are now case-tolerant too, but we still normalize
+      # here so a single canonical value reaches child processes.
+      case "$2" in
+        I|i) LOG_LEVEL=I ;;
+        W|w) LOG_LEVEL=W ;;
+        E|e) LOG_LEVEL=E ;;
+        *) log E mounts arg-parse "invalid --log-level: $2 (want I, W, or E)"; exit 1 ;;
+      esac
+      shift 2
+      ;;
     *) log E mounts arg-parse "unknown option: $1"; exit 1 ;;
   esac
 done
+: "${LOG_LEVEL:=W}"
 
 SYSTEM="$WORKDIR/.claude/.system"
 
@@ -75,12 +98,56 @@ log I mounts start "target=$TARGET source=$SYSTEM"
 
 mkdir -p "$TARGET"
 
-# Idempotency guard: if $TARGET is already a mountpoint we've already
-# assembled it in this VM/distro. Re-running would stack another set
-# of binds. Safe to skip — the existing layer already serves Claude.
+# Count args positionally (no subshell, no echo|wc pipeline).
+_count_words() { echo $#; }
+_RW_COUNT=$(_count_words $CONFIG_FILES)
+_RO_FILE_COUNT=$(_count_words $RO_FILES)
+_RO_DIR_COUNT=$(_count_words $RO_DIRS)
+
+# Roll back all binds under $TARGET and $SYSTEM, in reverse order, so
+# a retry starts from a clean slate. umount -R unwinds nested binds in
+# one shot. Safe to call when nothing is mounted: `|| true` swallows
+# the "not mounted" error.
+_rollback_mounts() {
+  umount -R "$TARGET" 2>/dev/null || true
+  umount -R "$SYSTEM" 2>/dev/null || true
+}
+
+# Trap-based teardown: if we fail mid-assembly (any step 2–5 errors
+# under `set -e`), the trap runs and rolls back whatever binds we
+# managed to lay down. A retry from the launcher then starts clean
+# instead of stacking another layer on top of the half-assembled tree.
+# _ASSEMBLED is flipped to 1 on successful completion so the trap
+# becomes a no-op on the happy path.
+_ASSEMBLED=0
+trap '
+  if [ "$_ASSEMBLED" = 0 ]; then
+    log W mounts rollback "partial assembly; unwinding binds"
+    _rollback_mounts
+  fi
+' EXIT
+
+# Idempotency / completeness check: if $TARGET is already a mountpoint
+# we've either fully assembled it previously (skip) or a prior run
+# crashed mid-way (tear down + re-assemble). Verify every expected
+# bind is in place before trusting the fast path.
 if mountpoint -q "$TARGET" 2>/dev/null; then
-  log I mounts skip "$TARGET already mounted"
-  exit 0
+  _complete=1
+  for _f in $CONFIG_FILES $RO_FILES; do
+    mountpoint -q "$TARGET/$_f" 2>/dev/null || { _complete=0; break; }
+  done
+  if [ "$_complete" = 1 ]; then
+    for _d in $RO_DIRS; do
+      mountpoint -q "$TARGET/$_d" 2>/dev/null || { _complete=0; break; }
+    done
+  fi
+  if [ "$_complete" = 1 ] && mountpoint -q "$SYSTEM" 2>/dev/null; then
+    log I mounts skip "$TARGET fully assembled"
+    _ASSEMBLED=1
+    exit 0
+  fi
+  log W mounts partial "$TARGET partially assembled; tearing down"
+  _rollback_mounts
 fi
 
 # Step 2: cr/ as the base mount. Anything Claude creates under
@@ -121,4 +188,5 @@ done
 mount --bind "$SYSTEM/.mask" "$SYSTEM"
 mount -o remount,bind,ro "$SYSTEM"
 
-log I mounts done "rw=$(echo $CONFIG_FILES | wc -w | tr -d ' ') ro-files=$(echo $RO_FILES | wc -w | tr -d ' ') ro-dirs=$(echo $RO_DIRS | wc -w | tr -d ' ')"
+_ASSEMBLED=1
+log I mounts done "rw=$_RW_COUNT ro-files=$_RO_FILE_COUNT ro-dirs=$_RO_DIR_COUNT"

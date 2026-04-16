@@ -100,26 +100,29 @@ $resolveArchive = { param($tier, $prefix)
   $cached[0]
 }
 
-# ── Per-tier builders ──
+# ── Tier builder ──
 #
-# Each $build*Tier is a self-contained script block that runs inside
-# its own Start-ThreadJob runspace. Thread-job runspaces don't inherit
-# the parent's script-scope script blocks ($archiveOk, $sha256, …) in
-# any reliable way, so the tier blocks take everything they need as
-# explicit parameters and re-define the tiny `archiveOk` helper inline.
+# One shared script block that runs inside each Start-ThreadJob
+# runspace. Thread-job runspaces don't inherit the parent's script
+# scope reliably, so the block takes everything as explicit params
+# (including a $vars hashtable with tier-specific URL/version bits)
+# and re-dot-sources Log.ps1 so Write-Log is available. Hashtables
+# serialize cleanly across runspace boundaries — script blocks do not,
+# which is why the tier-specific download logic lives in an inline
+# `switch ($tier)` rather than being passed in as a closure.
+#
 # Logging works because Write-Log writes to [Console]::Error directly
 # (see lib/Log.ps1) — that bypasses the job's Information stream so
 # tier output streams live to the parent terminal.
 #
-# Each tier builder writes its archive in-place under $toolsDir; no
-# return value is needed. The archive *path* is computed by the
-# orchestrator before the job starts and passed in.
-
-$buildBaseTier = {
-  param($logLevel, $projectRoot, $forcePull, $optBaseHash, $baseArchive,
-        $nodeVer, $rgVer, $microVer, $archNode, $archRg, $archMicro)
+# The archive path is computed by the orchestrator before the job
+# starts and passed in. The builder writes its archive in place; no
+# return value is needed.
+$tierBuilder = {
+  param($logLevel, $projectRoot, $tier, $archive, $optHash, $forcePull, $vars)
   $script:LogLevel = $logLevel
   . "$projectRoot\lib\Log.ps1"
+  $stage = "tools.$tier"
 
   $archiveOk = { param($p)
     if (-not [IO.File]::Exists($p)) { return $false }
@@ -128,161 +131,89 @@ $buildBaseTier = {
     return ($LASTEXITCODE -eq 0)
   }
 
-  if ($optBaseHash) {
-    if (-not (& $archiveOk $baseArchive)) {
-      Write-Log E tools.base fail "pinned archive is corrupt: $([IO.Path]::GetFileName($baseArchive))"
-      throw "pinned base archive is corrupt"
+  # Shared prologue: pin → cache-hit → rebuild-prep
+  if ($optHash) {
+    if (-not (& $archiveOk $archive)) {
+      Write-Log E $stage fail "pinned archive is corrupt: $([IO.Path]::GetFileName($archive))"
+      throw "pinned $tier archive is corrupt"
     }
-    Write-Log I tools.base cache-pin ([IO.Path]::GetFileName($baseArchive))
+    Write-Log I $stage cache-pin ([IO.Path]::GetFileName($archive))
     return
   }
-  if ((-not $forcePull) -and (& $archiveOk $baseArchive)) {
-    Write-Log I tools.base cache-hit ([IO.Path]::GetFileName($baseArchive))
+  if ((-not $forcePull) -and (& $archiveOk $archive)) {
+    Write-Log I $stage cache-hit ([IO.Path]::GetFileName($archive))
     return
   }
-  if ([IO.File]::Exists($baseArchive) -and -not $forcePull) {
-    Write-Log W tools.base rebuild "cached archive corrupt; rebuilding"
-    [IO.File]::Delete($baseArchive)
+  if ([IO.File]::Exists($archive) -and -not $forcePull) {
+    Write-Log W $stage rebuild "cached archive corrupt; rebuilding"
+    [IO.File]::Delete($archive)
   }
-  Write-Log I tools.base downloading "node $nodeVer, ripgrep $rgVer, micro $microVer"
 
   $h = [Net.Http.HttpClient]::new()
   $h.DefaultRequestHeaders.UserAgent.ParseAdd('claude-code-sandbox/1.0')
   $tmpDir = [IO.Path]::Combine([IO.Path]::GetTempPath(), "claude-build-$(Get-Random)")
   [IO.Directory]::CreateDirectory($tmpDir) > $null
   try {
-    $nodeUrl = "https://nodejs.org/dist/v${nodeVer}/node-v${nodeVer}-linux-${archNode}.tar.xz"
-    $rgUrl = "https://github.com/BurntSushi/ripgrep/releases/download/${rgVer}/ripgrep-${rgVer}-${archRg}.tar.gz"
-    $microUrl = "https://github.com/zyedidia/micro/releases/download/v${microVer}/micro-${microVer}-${archMicro}.tar.gz"
-    $nodeTask = $h.GetByteArrayAsync($nodeUrl)
-    $rgTask = $h.GetByteArrayAsync($rgUrl)
-    $microTask = $h.GetByteArrayAsync($microUrl)
-    [Threading.Tasks.Task]::WaitAll($nodeTask, $rgTask, $microTask)
+    # Tier-specific: download into $tmpDir and set $packInputs to the
+    # list of files to include in the final archive.
+    $packInputs = $null
+    switch ($tier) {
+      'base' {
+        Write-Log I $stage downloading "node $($vars.nodeVer), ripgrep $($vars.rgVer), micro $($vars.microVer)"
+        $nodeUrl = "https://nodejs.org/dist/v$($vars.nodeVer)/node-v$($vars.nodeVer)-linux-$($vars.archNode).tar.xz"
+        $rgUrl = "https://github.com/BurntSushi/ripgrep/releases/download/$($vars.rgVer)/ripgrep-$($vars.rgVer)-$($vars.archRg).tar.gz"
+        $microUrl = "https://github.com/zyedidia/micro/releases/download/v$($vars.microVer)/micro-$($vars.microVer)-$($vars.archMicro).tar.gz"
+        $nodeTask = $h.GetByteArrayAsync($nodeUrl)
+        $rgTask = $h.GetByteArrayAsync($rgUrl)
+        $microTask = $h.GetByteArrayAsync($microUrl)
+        [Threading.Tasks.Task]::WaitAll($nodeTask, $rgTask, $microTask)
 
-    $nodeTmp = "$tmpDir\_node.tar.xz"; [IO.File]::WriteAllBytes($nodeTmp, $nodeTask.Result)
-    tar -xJf $nodeTmp -C $tmpDir --strip-components=2 "node-v${nodeVer}-linux-${archNode}/bin/node"
-    [IO.File]::Delete($nodeTmp)
+        $nodeTmp = "$tmpDir\_node.tar.xz"; [IO.File]::WriteAllBytes($nodeTmp, $nodeTask.Result)
+        tar -xJf $nodeTmp -C $tmpDir --strip-components=2 "node-v$($vars.nodeVer)-linux-$($vars.archNode)/bin/node"
+        [IO.File]::Delete($nodeTmp)
 
-    $rgTmp = "$tmpDir\_rg.tar.gz"; [IO.File]::WriteAllBytes($rgTmp, $rgTask.Result)
-    tar -xzf $rgTmp -C $tmpDir --strip-components=1 "ripgrep-${rgVer}-${archRg}/rg"
-    [IO.File]::Delete($rgTmp)
+        $rgTmp = "$tmpDir\_rg.tar.gz"; [IO.File]::WriteAllBytes($rgTmp, $rgTask.Result)
+        tar -xzf $rgTmp -C $tmpDir --strip-components=1 "ripgrep-$($vars.rgVer)-$($vars.archRg)/rg"
+        [IO.File]::Delete($rgTmp)
 
-    $microTmp = "$tmpDir\_micro.tar.gz"; [IO.File]::WriteAllBytes($microTmp, $microTask.Result)
-    tar -xzf $microTmp -C $tmpDir --strip-components=1 "micro-${microVer}/micro"
-    [IO.File]::Delete($microTmp)
+        $microTmp = "$tmpDir\_micro.tar.gz"; [IO.File]::WriteAllBytes($microTmp, $microTask.Result)
+        tar -xzf $microTmp -C $tmpDir --strip-components=1 "micro-$($vars.microVer)/micro"
+        [IO.File]::Delete($microTmp)
 
-    [IO.File]::Copy("$projectRoot\bin\claude-wrapper.sh", "$tmpDir\claude-wrapper", $true)
-    Write-Log I tools.base packing ([IO.Path]::GetFileName($baseArchive))
-    # Build to a temp path and atomic-rename on success. If the
-    # process is killed mid-tar, the partial file sits at the
-    # .partial path and gets swept on the next run; the final
-    # archive path is never partially written.
-    $baseTmp = "$baseArchive.partial.$PID"
-    tar -cJf $baseTmp -C $tmpDir node rg micro claude-wrapper
-    [IO.File]::Move($baseTmp, $baseArchive, $true)
-    Write-Log I tools.base cached ([IO.Path]::GetFileName($baseArchive))
-  }
-  finally { try { [IO.Directory]::Delete($tmpDir, $true) } catch {} }
-}
+        [IO.File]::Copy("$projectRoot\bin\claude-wrapper.sh", "$tmpDir\claude-wrapper", $true)
+        $packInputs = @('node', 'rg', 'micro', 'claude-wrapper')
+      }
+      'tool' {
+        Write-Log I $stage downloading "pnpm $($vars.pnpmVer), uv $($vars.uvVer)"
+        $pnpmTask = $h.GetByteArrayAsync("https://github.com/pnpm/pnpm/releases/download/v$($vars.pnpmVer)/pnpm-$($vars.archPnpm)")
+        $uvTask = $h.GetByteArrayAsync("https://github.com/astral-sh/uv/releases/download/$($vars.uvVer)/uv-$($vars.archUv).tar.gz")
+        [Threading.Tasks.Task]::WaitAll($pnpmTask, $uvTask)
 
-$buildToolTier = {
-  param($logLevel, $projectRoot, $forcePull, $optToolHash, $toolArchive,
-        $pnpmVer, $uvVer, $archPnpm, $archUv)
-  $script:LogLevel = $logLevel
-  . "$projectRoot\lib\Log.ps1"
-
-  $archiveOk = { param($p)
-    if (-not [IO.File]::Exists($p)) { return $false }
-    if ([IO.FileInfo]::new($p).Length -eq 0) { return $false }
-    & tar -tJf $p *> $null
-    return ($LASTEXITCODE -eq 0)
-  }
-
-  if ($optToolHash) {
-    if (-not (& $archiveOk $toolArchive)) {
-      Write-Log E tools.tool fail "pinned archive is corrupt: $([IO.Path]::GetFileName($toolArchive))"
-      throw "pinned tool archive is corrupt"
+        [IO.File]::WriteAllBytes("$tmpDir\pnpm", $pnpmTask.Result)
+        $uvTmp = "$tmpDir\_uv.tar.gz"; [IO.File]::WriteAllBytes($uvTmp, $uvTask.Result)
+        tar -xzf $uvTmp -C $tmpDir --strip-components=1
+        [IO.File]::Delete($uvTmp)
+        $packInputs = @('pnpm', 'uv', 'uvx')
+      }
+      'claude' {
+        Write-Log I $stage downloading "claude $($vars.claudeVer)"
+        $gcsBucket = 'https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases'
+        $claudeBytes = $h.GetByteArrayAsync("$gcsBucket/$($vars.claudeVer)/$($vars.archClaude)/claude").Result
+        [IO.File]::WriteAllBytes("$tmpDir\claude", $claudeBytes)
+        $packInputs = @('claude')
+      }
+      default { throw "unknown tier: $tier" }
     }
-    Write-Log I tools.tool cache-pin ([IO.Path]::GetFileName($toolArchive))
-    return
-  }
-  if ((-not $forcePull) -and (& $archiveOk $toolArchive)) {
-    Write-Log I tools.tool cache-hit ([IO.Path]::GetFileName($toolArchive))
-    return
-  }
-  if ([IO.File]::Exists($toolArchive) -and -not $forcePull) {
-    Write-Log W tools.tool rebuild "cached archive corrupt; rebuilding"
-    [IO.File]::Delete($toolArchive)
-  }
-  Write-Log I tools.tool downloading "pnpm $pnpmVer, uv $uvVer"
 
-  $h = [Net.Http.HttpClient]::new()
-  $h.DefaultRequestHeaders.UserAgent.ParseAdd('claude-code-sandbox/1.0')
-  $tmpDir = [IO.Path]::Combine([IO.Path]::GetTempPath(), "claude-build-$(Get-Random)")
-  [IO.Directory]::CreateDirectory($tmpDir) > $null
-  try {
-    $pnpmTask = $h.GetByteArrayAsync("https://github.com/pnpm/pnpm/releases/download/v${pnpmVer}/pnpm-${archPnpm}")
-    $uvTask = $h.GetByteArrayAsync("https://github.com/astral-sh/uv/releases/download/${uvVer}/uv-${archUv}.tar.gz")
-    [Threading.Tasks.Task]::WaitAll($pnpmTask, $uvTask)
-
-    [IO.File]::WriteAllBytes("$tmpDir\pnpm", $pnpmTask.Result)
-    $uvTmp = "$tmpDir\_uv.tar.gz"; [IO.File]::WriteAllBytes($uvTmp, $uvTask.Result)
-    tar -xzf $uvTmp -C $tmpDir --strip-components=1
-    [IO.File]::Delete($uvTmp)
-
-    Write-Log I tools.tool packing ([IO.Path]::GetFileName($toolArchive))
-    $toolTmp = "$toolArchive.partial.$PID"
-    tar -cJf $toolTmp -C $tmpDir pnpm uv uvx
-    [IO.File]::Move($toolTmp, $toolArchive, $true)
-    Write-Log I tools.tool cached ([IO.Path]::GetFileName($toolArchive))
-  }
-  finally { try { [IO.Directory]::Delete($tmpDir, $true) } catch {} }
-}
-
-$buildClaudeTier = {
-  param($logLevel, $projectRoot, $forcePull, $optClaudeHash, $claudeArchive,
-        $claudeVer, $archClaude)
-  $script:LogLevel = $logLevel
-  . "$projectRoot\lib\Log.ps1"
-
-  $archiveOk = { param($p)
-    if (-not [IO.File]::Exists($p)) { return $false }
-    if ([IO.FileInfo]::new($p).Length -eq 0) { return $false }
-    & tar -tJf $p *> $null
-    return ($LASTEXITCODE -eq 0)
-  }
-
-  if ($optClaudeHash) {
-    if (-not (& $archiveOk $claudeArchive)) {
-      Write-Log E tools.claude fail "pinned archive is corrupt: $([IO.Path]::GetFileName($claudeArchive))"
-      throw "pinned claude archive is corrupt"
-    }
-    Write-Log I tools.claude cache-pin ([IO.Path]::GetFileName($claudeArchive))
-    return
-  }
-  if ((-not $forcePull) -and (& $archiveOk $claudeArchive)) {
-    Write-Log I tools.claude cache-hit ([IO.Path]::GetFileName($claudeArchive))
-    return
-  }
-  if ([IO.File]::Exists($claudeArchive) -and -not $forcePull) {
-    Write-Log W tools.claude rebuild "cached archive corrupt; rebuilding"
-    [IO.File]::Delete($claudeArchive)
-  }
-  Write-Log I tools.claude downloading "claude $claudeVer"
-
-  $h = [Net.Http.HttpClient]::new()
-  $h.DefaultRequestHeaders.UserAgent.ParseAdd('claude-code-sandbox/1.0')
-  $gcsBucket = 'https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases'
-  $tmpDir = [IO.Path]::Combine([IO.Path]::GetTempPath(), "claude-build-$(Get-Random)")
-  [IO.Directory]::CreateDirectory($tmpDir) > $null
-  try {
-    $claudeBytes = $h.GetByteArrayAsync("$gcsBucket/$claudeVer/$archClaude/claude").Result
-    [IO.File]::WriteAllBytes("$tmpDir\claude", $claudeBytes)
-    Write-Log I tools.claude packing ([IO.Path]::GetFileName($claudeArchive))
-    $claudeTmp = "$claudeArchive.partial.$PID"
-    tar -cJf $claudeTmp -C $tmpDir claude
-    [IO.File]::Move($claudeTmp, $claudeArchive, $true)
-    Write-Log I tools.claude cached ([IO.Path]::GetFileName($claudeArchive))
+    # Shared pack + atomic-rename. Build to a temp path and rename on
+    # success — if the process is killed mid-tar, the partial file
+    # sits at the .partial path and gets swept on the next run; the
+    # final archive path is never partially written.
+    Write-Log I $stage packing ([IO.Path]::GetFileName($archive))
+    $tmp = "$archive.partial.$PID"
+    tar -cJf $tmp -C $tmpDir @packInputs
+    [IO.File]::Move($tmp, $archive, $true)
+    Write-Log I $stage cached ([IO.Path]::GetFileName($archive))
   }
   finally { try { [IO.Directory]::Delete($tmpDir, $true) } catch {} }
 }
@@ -337,19 +268,26 @@ $buildToolArchives = {
   # — different downloads, different archive paths, no shared state —
   # so the cold-cache wall time drops from sum(tiers) to max(tiers).
   # On warm cache, the 3 `tar -tJf` validations also run concurrently.
+  $baseVars = @{
+    nodeVer   = $script:nodeVer;  rgVer    = $script:rgVer;    microVer = $script:microVer
+    archNode  = $script:archNode; archRg   = $script:archRg;   archMicro = $script:archMicro
+  }
+  $toolVars = @{
+    pnpmVer = $script:pnpmVer; uvVer = $script:uvVer
+    archPnpm = $script:archPnpm; archUv = $script:archUv
+  }
+  $claudeVars = @{
+    claudeVer = $script:claudeVer; archClaude = $script:archClaude
+  }
   $jobs = @(
-    Start-ThreadJob -ScriptBlock $buildBaseTier -ArgumentList @(
-      $script:LogLevel, $projectRoot, $forcePull, $optBaseHash, $script:baseArchive,
-      $script:nodeVer, $script:rgVer, $script:microVer,
-      $script:archNode, $script:archRg, $script:archMicro
+    Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
+      $script:LogLevel, $projectRoot, 'base', $script:baseArchive, $optBaseHash, $forcePull, $baseVars
     )
-    Start-ThreadJob -ScriptBlock $buildToolTier -ArgumentList @(
-      $script:LogLevel, $projectRoot, $forcePull, $optToolHash, $script:toolArchive,
-      $script:pnpmVer, $script:uvVer, $script:archPnpm, $script:archUv
+    Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
+      $script:LogLevel, $projectRoot, 'tool', $script:toolArchive, $optToolHash, $forcePull, $toolVars
     )
-    Start-ThreadJob -ScriptBlock $buildClaudeTier -ArgumentList @(
-      $script:LogLevel, $projectRoot, $forcePull, $optClaudeHash, $script:claudeArchive,
-      $script:claudeVer, $script:archClaude
+    Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
+      $script:LogLevel, $projectRoot, 'claude', $script:claudeArchive, $optClaudeHash, $forcePull, $claudeVars
     )
   )
   # Receive-Job -Wait re-throws any exception from a failed tier

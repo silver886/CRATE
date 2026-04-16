@@ -11,8 +11,8 @@ $ErrorActionPreference = 'Stop'
 
 # Normalize to uppercase. [ValidateSet] accepts any case (PS
 # validation is case-insensitive), but we forward the literal
-# value as LOG_LEVEL=<x> into the WSL distro, and the sh-side
-# `case "${LOG_LEVEL}" in I) ... E) ...` is case-SENSITIVE. A
+# value as `--log-level <x>` to setup-tools.sh / claude-wrapper.sh
+# inside the WSL distro, and sh-side `case` is case-SENSITIVE. A
 # stray `-LogLevel i` would otherwise silently fall through to
 # the default W threshold and hide I-level logs from setup-tools,
 # setup-system-mounts, claude-wrapper, enable-dnf, etc.
@@ -89,7 +89,7 @@ try {
     foreach ($archive in $baseArchive, $toolArchive, $claudeArchive) {
       $wslArchives += & $wslSrc $archive
     }
-    Invoke-Must wsl -d $distroName -u root -- env "LOG_LEVEL=$LogLevel" CLAUDE_BIN_DIR=/home/claude/.local/bin sh $wslSetup @wslArchives
+    Invoke-Must wsl -d $distroName -u root -- env CLAUDE_BIN_DIR=/home/claude/.local/bin sh $wslSetup --log-level $LogLevel @wslArchives
 
     # Bake setup-system-mounts.sh into the distro at a stable in-distro
     # path. Must happen here (while /mnt/c is still available via
@@ -127,8 +127,12 @@ try {
   # below as the unprivileged claude user — sudo/root is only used here
   # to do the mount syscalls.
   Write-Log I mounts assemble "/etc/claude-code-sandbox"
-  Invoke-Must wsl -d $distroName -u root -- env "LOG_LEVEL=$LogLevel" `
+  # Pass --log-level as an explicit arg rather than relying on env-var
+  # transport. Matches the podman-machine.sh pattern and keeps behavior
+  # consistent across sudo-crossing setup scripts.
+  Invoke-Must wsl -d $distroName -u root -- `
     /usr/local/libexec/claude-code-sandbox/setup-system-mounts.sh `
+    --log-level $LogLevel `
     --workdir /var/workdir `
     --target /etc/claude-code-sandbox `
     --config-files "$($configFiles -join ' ')" `
@@ -137,12 +141,12 @@ try {
 
   # ── Launch ──
 
-  $envArgs = "CLAUDE_CONFIG_DIR=/etc/claude-code-sandbox LOG_LEVEL=$LogLevel"
+  $envArgs = "CLAUDE_CONFIG_DIR=/etc/claude-code-sandbox"
   if ($AllowDnf) { $envArgs += ' CLAUDE_ENABLE_DNF=1' }
 
   Write-Log I run launch "wsl -d $distroName"
   Invoke-Must wsl -d $distroName --cd /var/workdir -- sh -c "
-    exec env $envArgs `$HOME/.local/bin/claude --dangerously-skip-permissions
+    exec env $envArgs `$HOME/.local/bin/claude --log-level $LogLevel --dangerously-skip-permissions
   "
 }
 finally {

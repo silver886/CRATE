@@ -49,11 +49,30 @@ MACHINE_ARGS=""
 
 # Tear the VM down on any exit. The project's .claude/.system layout
 # persists on the host — nothing to clean up there.
+#
+# File-leak guard: if `podman machine init` crashes partway through
+# (a known class of issue on macOS/vfkit — containers/podman#24725
+# family), a single `rm -f` can silently leave disk images behind.
+# We retry up to 3 times, re-verify via `podman machine inspect`, and
+# log a warning if the machine still appears in podman's state after
+# all attempts so a human can clean up rather than losing gigabytes
+# of orphaned qcow2 to silent leakage.
 MACHINE_NAME=""
 trap '
-  [ -n "$MACHINE_NAME" ] && log I vm teardown "$MACHINE_NAME"
-  [ -n "$MACHINE_NAME" ] && podman machine stop "$MACHINE_NAME" 2>/dev/null || true
-  [ -n "$MACHINE_NAME" ] && podman machine rm -f "$MACHINE_NAME" 2>/dev/null || true
+  if [ -n "$MACHINE_NAME" ]; then
+    log I vm teardown "$MACHINE_NAME"
+    podman machine stop "$MACHINE_NAME" 2>/dev/null || true
+    _i=0
+    while [ "$_i" -lt 3 ]; do
+      podman machine rm -f "$MACHINE_NAME" 2>/dev/null || true
+      podman machine inspect "$MACHINE_NAME" >/dev/null 2>&1 || break
+      _i=$((_i + 1))
+      sleep 1
+    done
+    if podman machine inspect "$MACHINE_NAME" >/dev/null 2>&1; then
+      log E vm leak "$MACHINE_NAME still present after 3 rm attempts; manual cleanup required (check ~/.local/share/containers/podman/machine/ and ~/.config/containers/podman/machine/)"
+    fi
+  fi
 ' EXIT
 
 init_launcher
@@ -92,7 +111,8 @@ log I mounts assemble "/etc/claude-code-sandbox"
 cat "$PROJECT_ROOT/bin/setup-system-mounts.sh" | podman machine ssh "$MACHINE_NAME" \
   'cat > /tmp/setup-system-mounts.sh && chmod +x /tmp/setup-system-mounts.sh'
 podman machine ssh "$MACHINE_NAME" \
-  "export LOG_LEVEL=${LOG_LEVEL:-W} && sudo --preserve-env=LOG_LEVEL /tmp/setup-system-mounts.sh \
+  "sudo /tmp/setup-system-mounts.sh \
+     --log-level ${LOG_LEVEL:-W} \
      --workdir /var/workdir \
      --target /etc/claude-code-sandbox \
      --config-files '$CONFIG_FILES' \
@@ -109,7 +129,7 @@ for _archive in "$BASE_ARCHIVE" "$TOOL_ARCHIVE" "$CLAUDE_ARCHIVE"; do
   cat "$_archive" | podman machine ssh "$MACHINE_NAME" "cat > /tmp/$_name"
   _ARCHIVE_ARGS="$_ARCHIVE_ARGS /tmp/$_name"
 done
-podman machine ssh "$MACHINE_NAME" "LOG_LEVEL=${LOG_LEVEL:-W} /tmp/setup-tools.sh$_ARCHIVE_ARGS"
+podman machine ssh "$MACHINE_NAME" "/tmp/setup-tools.sh --log-level ${LOG_LEVEL:-W}$_ARCHIVE_ARGS"
 
 # ── Launch ──
 #
@@ -121,10 +141,10 @@ podman machine ssh "$MACHINE_NAME" "LOG_LEVEL=${LOG_LEVEL:-W} /tmp/setup-tools.s
 # after claude exits.
 SSH_PORT=$(podman machine inspect "$MACHINE_NAME" --format '{{.SSHConfig.Port}}')
 SSH_KEY=$(podman machine inspect "$MACHINE_NAME" --format '{{.SSHConfig.IdentityPath}}')
-_ENV="CLAUDE_CONFIG_DIR=/etc/claude-code-sandbox LOG_LEVEL=${LOG_LEVEL:-W}"
+_ENV="CLAUDE_CONFIG_DIR=/etc/claude-code-sandbox"
 [ -n "$ALLOW_DNF" ] && _ENV="$_ENV CLAUDE_ENABLE_DNF=1"
 log I run launch "ssh -tt core@localhost (machine $MACHINE_NAME)"
 ssh -tt -p "$SSH_PORT" -i "$SSH_KEY" \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
   core@localhost \
-  "cd /var/workdir && exec env $_ENV \$HOME/.local/bin/claude --dangerously-skip-permissions"
+  "cd /var/workdir && exec env $_ENV \$HOME/.local/bin/claude --log-level ${LOG_LEVEL:-W} --dangerously-skip-permissions"

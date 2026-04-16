@@ -21,13 +21,13 @@
 # This avoids touching $env:, which is process-wide in PowerShell
 # and would pollute the caller's pwsh session after the script exits.
 #
-# Child processes that need to inherit the level get LOG_LEVEL
-# injected explicitly at the boundary call site:
+# LOG_LEVEL is NEVER injected as an env var (--env / env VAR=…).
+# Every process boundary uses an explicit --log-level arg:
 #
 #   Ensure-Credential.ps1  & ./lib/Ensure-Credential.ps1 -LogLevel $script:LogLevel
-#   podman container       podman run --env LOG_LEVEL=$LogLevel …
-#   wsl -u root            wsl … env LOG_LEVEL=$LogLevel cmd
-#   sudo (in sandbox)      sudo --preserve-env=LOG_LEVEL cmd  (env set by podman --env)
+#   podman container       setup-tools.sh parses --log-level from CMD tail
+#   wsl -u root            sh $wslSetup --log-level $LogLevel …
+#   sudo (in sandbox)      enable-dnf.sh --log-level $LOG_LEVEL
 #
 # Levels:
 #   I   show everything (verbose; opt-in)
@@ -81,7 +81,14 @@ function Write-Log {
     [Parameter(Mandatory)][string]$Event,
     [string]$Msg = ''
   )
-  $threshold = switch ($script:LogLevel) { 'I' { 1 } 'E' { 3 } default { 2 } }
+  # Normalize: [ValidateSet] and PS `switch` are case-insensitive, and
+  # hashtable key lookup (for $c[$Level]) is also case-insensitive by
+  # default — so 'i'/'w'/'e' work today by accident. Force uppercase
+  # here so we don't rely on those defaults if the hashtable is ever
+  # rebuilt with an ordinal comparer.
+  $Level = $Level.ToUpperInvariant()
+  $normLogLevel = if ($script:LogLevel) { $script:LogLevel.ToUpperInvariant() } else { 'W' }
+  $threshold = switch ($normLogLevel) { 'I' { 1 } 'E' { 3 } default { 2 } }
   $msgLevel = switch ($Level) { 'W' { 2 } 'E' { 3 } default { 1 } }
   if ($msgLevel -lt $threshold) { return }
   $ts = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')

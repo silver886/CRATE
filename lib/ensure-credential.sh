@@ -4,11 +4,9 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$(dirname "$SCRIPT_DIR")/lib/log.sh"
 
-# Standalone --log-level support. When invoked from the launcher,
-# init_launcher() prefixes the call with `LOG_LEVEL=$LOG_LEVEL …` to
-# inject the value into this subprocess's env-derived shell var. The
-# loop below is a no-op in that path; standalone callers can pass
-# --log-level themselves.
+# --log-level arg: the launcher calls us with an explicit --log-level
+# arg (init_launcher passes `--log-level $LOG_LEVEL`). LOG_LEVEL is
+# never inherited from env — every boundary passes it as an arg.
 while [ $# -gt 0 ]; do
   case "$1" in
     --log-level)

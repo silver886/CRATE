@@ -105,6 +105,11 @@ for _d in $RO_DIRS; do
 done
 
 log I run launch "podman container run $IMAGE_TAG"
+# --log-level is appended after the image tag as CMD args. The
+# Containerfile ENTRYPOINT is setup-tools.sh, which parses the flag
+# from its tail args and forwards it to claude-wrapper.sh (the
+# renamed `claude`). No LOG_LEVEL env var crosses the container
+# boundary — every hop passes the level as an explicit arg.
 podman container run --interactive --tty --rm \
   --userns=keep-id:uid=1000,gid=1000 \
   $SELINUX_OPT \
@@ -116,6 +121,6 @@ podman container run --interactive --tty --rm \
   -v "$SYSTEM_DIR/.mask:/var/workdir/.claude/.system:ro" \
   --workdir /var/workdir \
   --env CLAUDE_CONFIG_DIR=/etc/claude-code-sandbox \
-  --env "LOG_LEVEL=${LOG_LEVEL:-W}" \
   ${ALLOW_DNF:+--env CLAUDE_ENABLE_DNF=1} \
-  "$IMAGE_TAG"
+  "$IMAGE_TAG" \
+  --log-level "${LOG_LEVEL:-W}"

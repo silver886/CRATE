@@ -270,7 +270,11 @@ build_tool_archives() {
   if [ -n "${OPT_BASE_HASH:-}" ]; then
     BASE_ARCHIVE=$(resolve_archive "base" "$OPT_BASE_HASH")
   else
-    BASE_HASH=$(sha256 "base-node:$NODE_VER-rg:$RG_VER-micro:$MICRO_VER-$(cat "$PROJECT_ROOT/bin/claude-wrapper.sh")")
+    # Strip CR so the hash matches the Windows-side Tools.ps1 computation
+    # (which normalizes CRLF→LF before hashing). A CRLF checkout on a
+    # Unix host would otherwise produce a cache that can never be reused
+    # by a PS-side launcher against the same source.
+    BASE_HASH=$(sha256 "base-node:$NODE_VER-rg:$RG_VER-micro:$MICRO_VER-$(tr -d '\r' < "$PROJECT_ROOT/bin/claude-wrapper.sh")")
     BASE_ARCHIVE="$TOOLS_DIR/base-$BASE_HASH.tar.xz"
   fi
   if [ -n "${OPT_TOOL_HASH:-}" ]; then

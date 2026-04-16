@@ -4,14 +4,20 @@
 set -eu
 
 # Inline structured logger — same format, threshold, and color
-# semantics as lib/log.sh. LOG_LEVEL is passed in as a --log-level
-# arg by the caller (claude-wrapper.sh) because Fedora sudoers
-# env_check blocks unknown env vars even with --preserve-env=.
-# Colors disabled when $NO_COLOR is set or stderr is not a tty.
+# semantics as lib/log.sh. LOG_LEVEL is set from `--log-level` arg
+# parsing below; never inherited from env. Passed by the caller
+# (claude-wrapper.sh) as an explicit arg because sudo env_check
+# strips unknown env vars. Colors disabled when $NO_COLOR is set
+# or stderr is not a tty.
 if [ -z "${NO_COLOR:-}" ] && [ -t 2 ]; then _LOG_C=1; else _LOG_C=; fi
 log() {
-  _t=2; case "${LOG_LEVEL:-W}" in I) _t=1 ;; E) _t=3 ;; esac
-  _m=1; case "$1"               in W) _m=2 ;; E) _m=3 ;; esac
+  # Normalize LOG_LEVEL to uppercase so `LOG_LEVEL=i` from env (or any
+  # future path that forgets to normalize upstream) doesn't silently
+  # fall through to the default W threshold and hide I-level logs.
+  _ll=${LOG_LEVEL:-W}
+  case "$_ll" in i) _ll=I ;; w) _ll=W ;; e) _ll=E ;; esac
+  _t=2; case "$_ll" in I) _t=1 ;; E) _t=3 ;; esac
+  _m=1; case "$1"   in W) _m=2 ;; E) _m=3 ;; esac
   [ "$_m" -lt "$_t" ] && return 0
   if [ -n "$_LOG_C" ]; then
     case "$1" in
