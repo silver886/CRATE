@@ -20,11 +20,17 @@
 # changes are ephemeral. Each launch starts with stock /etc/group
 # (core in sudo) and re-applies the strip before the agent session.
 #
-# Why the agent-wrapper purge contract still holds: agent-wrapper.sh
-# guards `sudo enable-dnf --purge` behind `if [ -x .../enable-dnf ]`.
-# The FCOS backend doesn't install enable-dnf, so the wrapper never
-# invokes sudo — and after this script runs, no sudo is available
-# anyway, regardless.
+# Why the agent-wrapper purge contract still holds: script/podman-
+# machine.sh installs enable-dnf at /usr/local/lib/crate/enable-dnf
+# AND a per-user sudoers rule `core ALL=(root) NOPASSWD: .../enable-dnf`
+# (config/sudoers-enable-dnf.tmpl). The wrapper detects the helper and
+# does invoke `sudo enable-dnf --purge` once at startup — that single
+# narrow sudo call is the residual privilege after this script runs.
+# Per-user sudoers rules are independent of group membership, so the
+# rule survives our gpasswd -d below; it grants access only to the one
+# enable-dnf binary, which itself self-purges on the wrapper's --purge
+# call before the agent ever runs. After that purge, the agent has no
+# sudo capability at all.
 set -eu
 . /usr/local/lib/crate/log.sh
 

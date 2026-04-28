@@ -18,6 +18,7 @@ cred_check() {
   fi
 
   _status=$(curl -sSL -o /dev/null -w "%{http_code}" \
+    -A "$CRATE_USER_AGENT" \
     -H "Authorization: Bearer $ACCESS_TOKEN" \
     'https://www.googleapis.com/oauth2/v3/userinfo') || _status="000"
 
@@ -48,24 +49,50 @@ cred_check() {
   _cid_enc=$(printf '%s' "$_cid"    | jq -sRr '@uri')
   _sec_enc=$(printf '%s' "$_secret" | jq -sRr '@uri')
 
-  _response=$(curl -sSL -X POST "$_endpoint" \
+  # Capture body → tmp file, status → stdout in one call so we can gate
+  # on HTTP status before trusting the JSON. Mirrors lib/cred/oauth-
+  # anthropic.sh:54-67 and the .ps1 IsSuccessStatusCode check; without
+  # this gate, 429/5xx/proxy-error bodies all collapse into the same
+  # generic "re-authenticate" path and hide the real failure.
+  #
+  # mktemp (not "$$") so a multi-user host can't pre-create the path as a
+  # symlink and have curl follow it, and can't read the response body
+  # before we delete it. mktemp uses O_CREAT|O_EXCL with mode 600 — the
+  # filename is unguessable and unreadable by other local users.
+  _tmp=$(mktemp "${TMPDIR:-/tmp}/cred-google.XXXXXXXX") || {
+    log E cred fail "failed to create temp file under ${TMPDIR:-/tmp}"
+    exit 1
+  }
+  trap 'rm -f "$_tmp"' EXIT INT HUP TERM
+  _rstatus=$(curl -sSL -o "$_tmp" -w "%{http_code}" -X POST "$_endpoint" \
+    -A "$CRATE_USER_AGENT" \
     -H 'Content-Type: application/x-www-form-urlencoded' \
     --data "grant_type=refresh_token&refresh_token=${_rt_enc}&client_id=${_cid_enc}&client_secret=${_sec_enc}") \
-    || _response=""
+    || _rstatus="000"
 
-  _new_access=$(printf '%s' "$_response" | jq -r '.access_token // empty' 2>/dev/null)
+  case "$_rstatus" in
+    2??) ;;
+    *)
+      log E cred fail "OAuth refresh failed (HTTP $_rstatus); run 'gemini' to re-authenticate"
+      exit 1
+      ;;
+  esac
+
+  _new_access=$(jq -r '.access_token // empty' "$_tmp" 2>/dev/null)
   if [ -z "$_new_access" ]; then
-    log E cred fail "OAuth refresh failed; run 'gemini' to re-authenticate"
+    rm -f "$_tmp"
+    log E cred fail "OAuth refresh response missing access_token; run 'gemini' to re-authenticate"
     exit 1
   fi
   # Fall back to Google's documented default access-token lifetime (1h)
   # when the response omits expires_in. expiry_date is kept in sync so
   # google-auth-library's own probes still see a valid-looking stamp.
   # https://developers.google.com/identity/protocols/oauth2#expiration
-  _expires_in=$(printf '%s' "$_response" | jq -r '.expires_in // 3600')
+  _expires_in=$(jq -r '.expires_in // 3600' "$_tmp")
+  _new_id=$(jq -r '.id_token // empty' "$_tmp")
+  rm -f "$_tmp"
   _now_ms=$(($(date +%s) * 1000))
   _new_expiry=$((_now_ms + _expires_in * 1000))
-  _new_id=$(printf '%s' "$_response" | jq -r '.id_token // empty')
 
   _cred_new=$(jq -c \
     --arg at   "$_new_access" \
@@ -75,6 +102,8 @@ cred_check() {
   if [ -n "$_new_id" ]; then
     _cred_new=$(printf '%s' "$_cred_new" | jq -c --arg it "$_new_id" '.id_token = $it')
   fi
-  printf '%s' "$_cred_new" > "$CRED_PATH"
+  # See oauth-anthropic.sh for why we use cred_inplace_write instead
+  # of `>` redirect or tmp+rename.
+  printf '%s' "$_cred_new" | cred_inplace_write "$CRED_PATH"
   log I cred ok "refreshed (expires in ${_expires_in}s)"
 }

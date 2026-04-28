@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 # agent-wrapper.sh — generic launcher wrapper packed into every tier-3
 # archive. Sources its per-agent agent-manifest.sh (baked in alongside
-# it) to load AGENT_BINARY, AGENT_LAUNCH_FLAGS, and per-agent env
-# exports, then execs the real agent binary.
+# it) to load AGENT_BINARY, the exec_agent_with_flags function, and
+# per-agent env exports, then execs the real agent binary.
 
 . /usr/local/lib/crate/log.sh
 
@@ -21,7 +21,7 @@ if [ "${1:-}" = "--log-level" ]; then
 fi
 : "${LOG_LEVEL:=W}"
 
-# Load per-agent manifest (AGENT_BINARY, AGENT_LAUNCH_FLAGS, exports).
+# Load per-agent manifest (AGENT_BINARY, exec_agent_with_flags, exports).
 # Resolve the wrapper's own directory robustly: $0 may be absolute,
 # cwd-relative, or a bare basename when invoked via PATH. The agent
 # always installs to $HOME/.local/bin, so fall back there if the
@@ -68,5 +68,7 @@ export EDITOR=micro
 _bin="$_dir/${AGENT_BINARY}-bin"
 [ -x "$_bin" ] || { log E run fail "$AGENT_BINARY binary not found at $_bin"; exit 1; }
 
-# $AGENT_LAUNCH_FLAGS is a space-separated string; intentional word-split.
-exec "$_bin" $AGENT_LAUNCH_FLAGS "$@"
+# Launch flags are baked into exec_agent_with_flags() (defined in
+# agent-manifest.sh) as discrete positional arguments so each flag
+# preserves its boundary even if it contains whitespace or is empty.
+exec_agent_with_flags "$_bin" "$@"

@@ -11,6 +11,8 @@
 #   --workdir     DIR    host workdir mount point (default: /var/workdir)
 #   --project-dir NAME   agent's project dir basename, e.g. ".claude",
 #                        ".gemini", ".codex"
+#   --session-id  ID     8-char base36 session id (resolved on host).
+#                        Selects which sessions/<id>/cr/ to bind as base.
 #   --target      DIR    sandbox config dir (e.g. /usr/local/etc/crate/claude
 #                        when the agent honors a config-dir env var, or
 #                        /home/agent/.gemini for agents that don't)
@@ -39,6 +41,7 @@ set -euo pipefail
 
 WORKDIR=/var/workdir
 PROJECT_DIR=""
+SESSION_ID=""
 TARGET=""
 _CF_B64=""
 _RF_B64=""
@@ -47,6 +50,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --workdir)      WORKDIR="$2"; shift 2 ;;
     --project-dir)  PROJECT_DIR="$2"; shift 2 ;;
+    --session-id)   SESSION_ID="$2"; shift 2 ;;
     --target)       TARGET="$2"; shift 2 ;;
     --config-files) _CF_B64="$2"; shift 2 ;;
     --ro-files)     _RF_B64="$2"; shift 2 ;;
@@ -65,10 +69,14 @@ while [ $# -gt 0 ]; do
 done
 : "${LOG_LEVEL:=W}"
 
-if [ -z "$PROJECT_DIR" ] || [ -z "$TARGET" ]; then
-  log E mounts arg-parse "--project-dir and --target are required"
+if [ -z "$PROJECT_DIR" ] || [ -z "$TARGET" ] || [ -z "$SESSION_ID" ]; then
+  log E mounts arg-parse "--project-dir, --target, and --session-id are required"
   exit 1
 fi
+case "$SESSION_ID" in
+  [0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z]) ;;
+  *) log E mounts arg-parse "--session-id must be 8 lowercase base36 chars: '$SESSION_ID'"; exit 1 ;;
+esac
 
 # Decode base64 → NUL-delimited bytes → bash array. Empty input ⇒ empty
 # array (skipping the read loop entirely so set -u doesn't choke on a
@@ -90,8 +98,9 @@ if [ -n "$_RD_B64" ]; then
 fi
 
 SYSTEM="$WORKDIR/$PROJECT_DIR/.system"
+SESSION_CR="$SYSTEM/sessions/$SESSION_ID/cr"
 
-log I mounts start "target=$TARGET source=$SYSTEM"
+log I mounts start "target=$TARGET source=$SESSION_CR"
 
 mkdir -p "$TARGET"
 
@@ -127,12 +136,15 @@ if mountpoint -q "$TARGET" 2>/dev/null; then
   _rollback_mounts
 fi
 
-# Step 2: cr/ as the base mount.
-mount --bind "$SYSTEM/cr" "$TARGET"
+# Step 2: per-session cr/ as the base mount.
+mount --bind "$SESSION_CR" "$TARGET"
 
 # Step 3: writable file overlay.
+# Manifest validation allows nested entries (e.g. `rules/foo/bar.json`);
+# create the dirname before touch+bind so a nested overlay assembles.
 _RW_COUNT=0
 for _f in ${CONFIG_FILES[@]+"${CONFIG_FILES[@]}"}; do
+  mkdir -p "$(dirname "$TARGET/$_f")"
   touch "$TARGET/$_f"
   mount --bind "$SYSTEM/rw/$_f" "$TARGET/$_f"
   _RW_COUNT=$((_RW_COUNT + 1))
@@ -141,6 +153,7 @@ done
 # Step 4a: read-only single files
 _RO_FILE_COUNT=0
 for _f in ${RO_FILES[@]+"${RO_FILES[@]}"}; do
+  mkdir -p "$(dirname "$TARGET/$_f")"
   touch "$TARGET/$_f"
   mount --bind "$SYSTEM/ro/$_f" "$TARGET/$_f"
   mount -o remount,bind,ro "$TARGET/$_f"
@@ -161,4 +174,4 @@ mount --bind "$SYSTEM/.mask" "$SYSTEM"
 mount -o remount,bind,ro "$SYSTEM"
 
 _ASSEMBLED=1
-log I mounts done "rw=$_RW_COUNT ro-files=$_RO_FILE_COUNT ro-dirs=$_RO_DIR_COUNT"
+log I mounts done "session=$SESSION_ID rw=$_RW_COUNT ro-files=$_RO_FILE_COUNT ro-dirs=$_RO_DIR_COUNT"

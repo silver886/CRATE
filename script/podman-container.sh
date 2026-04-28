@@ -15,15 +15,19 @@ OPT_AGENT_HASH=""
 FORCE_PULL=""
 BASE_IMAGE="fedora:latest"
 ALLOW_DNF=""
+OPT_NEW_SESSION=""
+OPT_SESSION_ID=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --agent)      AGENT="$2"; shift 2 ;;
-    --base-hash)  OPT_BASE_HASH="$2"; shift 2 ;;
-    --tool-hash)  OPT_TOOL_HASH="$2"; shift 2 ;;
-    --agent-hash) OPT_AGENT_HASH="$2"; shift 2 ;;
-    --force-pull) FORCE_PULL=1; shift ;;
-    --image)      BASE_IMAGE="$2"; shift 2 ;;
-    --allow-dnf)  ALLOW_DNF=1; shift ;;
+    --agent)        AGENT="$2"; shift 2 ;;
+    --base-hash)    OPT_BASE_HASH="$2"; shift 2 ;;
+    --tool-hash)    OPT_TOOL_HASH="$2"; shift 2 ;;
+    --agent-hash)   OPT_AGENT_HASH="$2"; shift 2 ;;
+    --force-pull)   FORCE_PULL=1; shift ;;
+    --image)        BASE_IMAGE="$2"; shift 2 ;;
+    --allow-dnf)    ALLOW_DNF=1; shift ;;
+    --new-session)  OPT_NEW_SESSION=1; shift ;;
+    --session)      OPT_SESSION_ID="$2"; shift 2 ;;
     --log-level)
       case "$2" in
         I|i) LOG_LEVEL=I ;;
@@ -37,6 +41,24 @@ while [ $# -gt 0 ]; do
   esac
 done
 : "${LOG_LEVEL:=W}"
+if [ -n "$OPT_NEW_SESSION" ] && [ -n "$OPT_SESSION_ID" ]; then
+  log E launcher arg-parse "--new-session and --session are mutually exclusive"
+  exit 1
+fi
+
+# Podman parses `-v "src:dst[:opts]"` by colon — a host path containing
+# `:` (legal on Linux/macOS) silently re-routes the mount or breaks
+# the launch. Reject upfront on every base that bind sources derive
+# from in this script: $PWD ($SESSION_DIR / $SYSTEM_DIR under
+# $PWD/$AGENT_PROJECT_DIR/.system), $HOME (default cache root), and
+# $TOOLS_DIR (where the three archive binds resolve — set via
+# $XDG_CACHE_HOME if exported, so $HOME alone doesn't cover it).
+# Clearer than letting Podman fail mid-launch.
+for _hp in "$PWD" "${HOME:-}" "$TOOLS_DIR"; do
+  case "$_hp" in
+    *:*) log E launcher fail "host path '$_hp' contains ':' — Podman uses ':' as the volume source/destination separator. Move the project (or your cache/HOME) to a path without colons and retry."; exit 1 ;;
+  esac
+done
 
 # SELinux detection
 SELINUX_OPT=""
@@ -59,7 +81,7 @@ init_launcher
 # ── Build base image ──
 
 _IMG_HASHES=""
-for _f in Containerfile lib/log.sh bin/enable-dnf.sh bin/setup-tools.sh config/sudoers-enable-dnf.tmpl; do
+for _f in Containerfile .containerignore lib/log.sh bin/enable-dnf.sh bin/setup-tools.sh config/sudoers-enable-dnf.tmpl; do
   _IMG_HASHES="$_IMG_HASHES$(sha256_file "$PROJECT_ROOT/$_f")"
 done
 IMAGE_TAG="crate-base-$(sha256 "$_IMG_HASHES-$BASE_IMAGE")"
@@ -76,13 +98,13 @@ fi
 # ── Run ──
 #
 # System config assembly via podman -v stacking:
-#   1. cr/ as the base of $CRATE_DIR (rw, persists per project)
+#   1. sessions/<id>/cr/ as the base of $CRATE_DIR (rw, persists per session)
 #   2. rw/<f> per-file mounts (EBUSY → in-place writeFileSync → host sync)
 #   3. ro/<x>:ro per-file/per-subdir (read-only)
 #   4. .mask/ bind (read-only) over /var/workdir/<projectDir>/.system
 #      to mask system scope from project scope
 
-set -- -v "$SYSTEM_DIR/cr:$CRATE_DIR"
+set -- -v "$SESSION_DIR/cr:$CRATE_DIR"
 for _f in ${CONFIG_FILES[@]+"${CONFIG_FILES[@]}"}; do
   set -- "$@" -v "$SYSTEM_DIR/rw/$_f:$CRATE_DIR/$_f"
 done

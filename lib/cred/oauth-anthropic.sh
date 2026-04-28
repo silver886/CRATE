@@ -51,7 +51,18 @@ cred_check() {
   # HTTP status before trusting the JSON. Mirrors ps1 IsSuccessStatusCode
   # (lib/cred/oauth-anthropic.ps1:62-65). Without this gate, any non-2xx
   # body is reported as a generic "OAuth refresh failed" with no code.
-  _tmp="${TMPDIR:-/tmp}/cred-anthropic-$$.json"
+  #
+  # mktemp (not "$$") so a multi-user host can't pre-create the path as a
+  # symlink and have curl follow it, and can't read the response body
+  # before we delete it. mktemp uses O_CREAT|O_EXCL with mode 600 — the
+  # filename is unguessable and unreadable by other local users. The
+  # EXIT/INT/HUP/TERM trap is a safety net for SIGTERM-mid-curl scenarios
+  # where the explicit `rm -f` after parsing is bypassed.
+  _tmp=$(mktemp "${TMPDIR:-/tmp}/cred-anthropic.XXXXXXXX") || {
+    log E cred fail "failed to create temp file under ${TMPDIR:-/tmp}"
+    exit 1
+  }
+  trap 'rm -f "$_tmp"' EXIT INT HUP TERM
   _rstatus=$(curl -sSL -o "$_tmp" -w "%{http_code}" -X POST "$_endpoint" \
     -H "User-Agent:" \
     -H 'Content-Type: application/json' \
@@ -60,7 +71,6 @@ cred_check() {
   case "$_rstatus" in
     2??) ;;
     *)
-      rm -f "$_tmp"
       log E cred fail "OAuth refresh failed (HTTP $_rstatus); run 'claude' to re-authenticate"
       exit 1
       ;;
@@ -86,6 +96,11 @@ cred_check() {
   if [ -n "$_new_refresh" ]; then
     _cred_new=$(printf '%s' "$_cred_new" | jq -c --arg rt "$_new_refresh" '.claudeAiOauth.refreshToken = $rt')
   fi
-  printf '%s' "$_cred_new" > "$CRED_PATH"
+  # cred_inplace_write (lib/common.sh) overwrites the live inode
+  # without truncating it first, so hardlinks/junctions/bind mounts
+  # to $CRED_PATH stay live AND the file never appears empty during
+  # the write window. tmp + JSON validate before touching the live
+  # file gates against an upstream that returned a partial body.
+  printf '%s' "$_cred_new" | cred_inplace_write "$CRED_PATH"
   log I cred ok "refreshed (expires in ${_expires_in}s)"
 }

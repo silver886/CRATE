@@ -11,7 +11,7 @@
     "ro":     ["CLAUDE.md", "keybindings.json"],
     "roDirs": ["rules", "commands", "agents", "output-styles", "skills"]
   },
-  "credential": { "strategy": "oauth-anthropic" },
+  "credential": { "strategy": "oauth-anthropic", "file": ".credentials.json" },
   "executable": {
     "type":           "platform-binary",
     "versionPackage": "@anthropic-ai/claude-code",

@@ -46,6 +46,23 @@ if [ -z "$TARGET_USER" ]; then
   log E dnf fail "no target user (pass --user USER or invoke via sudo)"
   exit 1
 fi
+# TARGET_USER is interpolated into /etc/sudoers.d/<user>-{dnf,enable-dnf}
+# while running as root. A crafted value like '../foo' or 'a/b' would
+# write or unlink an arbitrary file under /etc/sudoers.d/ (or escape it
+# entirely). Whitelist a strict username grammar AND verify the account
+# actually exists in NSS — neither alone is sufficient: the regex blocks
+# path/control chars, the NSS check blocks "valid-looking but
+# nonexistent" usernames that would silently create dangling rules.
+case "$TARGET_USER" in
+  ''|.|..|*[!A-Za-z0-9._-]*)
+    log E dnf fail "invalid target user: '$TARGET_USER' (must match [A-Za-z0-9._-]+ and not be '.' or '..')"
+    exit 1
+    ;;
+esac
+if ! id -u "$TARGET_USER" >/dev/null 2>&1; then
+  log E dnf fail "target user does not exist: '$TARGET_USER'"
+  exit 1
+fi
 
 if [ -n "$ENABLE" ]; then
   printf '%s ALL=(root) NOPASSWD: /usr/bin/dnf\n' "$TARGET_USER" > "/etc/sudoers.d/${TARGET_USER}-dnf"

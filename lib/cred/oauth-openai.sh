@@ -22,6 +22,7 @@ cred_check() {
   fi
 
   _status=$(curl -sSL -o /dev/null -w "%{http_code}" \
+    -A "$CRATE_USER_AGENT" \
     -H "Authorization: Bearer $ACCESS_TOKEN" \
     'https://auth.openai.com/oauth/userinfo') || _status="000"
 
@@ -49,19 +50,54 @@ cred_check() {
     --arg cid "$_cid" \
     '{grant_type:"refresh_token",refresh_token:$rt,client_id:$cid}')
 
-  _response=$(curl -sSL -X POST "$_endpoint" \
+  # Capture body → tmp file, status → stdout in one call so we can gate
+  # on HTTP status before trusting the JSON. Mirrors lib/cred/oauth-
+  # anthropic.sh:54-67 and the .ps1 IsSuccessStatusCode check; without
+  # this gate, 429/5xx/proxy-error bodies all collapse into the same
+  # generic "re-authenticate" path and hide the real failure.
+  #
+  # mktemp (not "$$") so a multi-user host can't pre-create the path as a
+  # symlink and have curl follow it, and can't read the response body
+  # before we delete it. mktemp uses O_CREAT|O_EXCL with mode 600 — the
+  # filename is unguessable and unreadable by other local users.
+  _tmp=$(mktemp "${TMPDIR:-/tmp}/cred-openai.XXXXXXXX") || {
+    log E cred fail "failed to create temp file under ${TMPDIR:-/tmp}"
+    exit 1
+  }
+  trap 'rm -f "$_tmp"' EXIT INT HUP TERM
+  _rstatus=$(curl -sSL -o "$_tmp" -w "%{http_code}" -X POST "$_endpoint" \
+    -A "$CRATE_USER_AGENT" \
     -H 'Content-Type: application/json' \
-    -d "$_body" 2>/dev/null) || _response=""
+    -d "$_body") || _rstatus="000"
 
-  _new_access=$(printf '%s' "$_response" | jq -r '.access_token // empty')
-  _new_id=$(printf '%s'     "$_response" | jq -r '.id_token     // empty')
+  case "$_rstatus" in
+    2??) ;;
+    *)
+      log E cred fail "OAuth refresh failed (HTTP $_rstatus); run 'codex login' to re-authenticate"
+      exit 1
+      ;;
+  esac
+
+  _new_access=$(jq -r '.access_token // empty' "$_tmp")
+  _new_id=$(jq     -r '.id_token     // empty' "$_tmp")
   if [ -z "$_new_access" ] || [ -z "$_new_id" ]; then
-    log E cred fail "OAuth refresh failed; run 'codex login' to re-authenticate"
+    rm -f "$_tmp"
+    log E cred fail "OAuth refresh response missing access_token or id_token; run 'codex login' to re-authenticate"
     exit 1
   fi
-  _new_refresh=$(printf '%s' "$_response" | jq -r '.refresh_token // empty')
+  _new_refresh=$(jq -r '.refresh_token // empty' "$_tmp")
+  rm -f "$_tmp"
 
-  _now_iso=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+  # Reuse the lib/log.sh ms-support probe ($_log_has_ms); the launcher
+  # chain sources log.sh before this strategy is dispatched. A bare
+  # `date … || date …` fallback would silently store an invalid RFC
+  # 3339 timestamp on BSD/macOS where `date` prints the literal "%3N"
+  # instead of failing.
+  if [ -n "${_log_has_ms:-}" ]; then
+    _now_iso=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+  else
+    _now_iso=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+  fi
   _cred_new=$(jq -c \
     --arg at  "$_new_access" \
     --arg it  "$_new_id" \
@@ -73,6 +109,8 @@ cred_check() {
   if [ -n "$_new_refresh" ]; then
     _cred_new=$(printf '%s' "$_cred_new" | jq -c --arg rt "$_new_refresh" '.tokens.refresh_token = $rt')
   fi
-  printf '%s' "$_cred_new" > "$CRED_PATH"
+  # See oauth-anthropic.sh for why we use cred_inplace_write instead
+  # of `>` redirect or tmp+rename.
+  printf '%s' "$_cred_new" | cred_inplace_write "$CRED_PATH"
   log I cred ok "refreshed"
 }

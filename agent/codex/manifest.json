@@ -11,7 +11,7 @@
     "ro":     ["AGENTS.md", "AGENTS.override.md"],
     "roDirs": ["rules"]
   },
-  "credential": { "strategy": "oauth-openai" },
+  "credential": { "strategy": "oauth-openai", "file": "auth.json" },
   "executable": {
     "type":           "platform-binary",
     "versionPackage": "@openai/codex",

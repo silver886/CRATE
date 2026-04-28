@@ -11,23 +11,29 @@ OPT_BASE_HASH=""
 OPT_TOOL_HASH=""
 OPT_AGENT_HASH=""
 FORCE_PULL=""
-BASE_IMAGE=""
+MACHINE_IMAGE=""
 MACHINE_CPUS=""
 MACHINE_MEMORY=""
 MACHINE_DISK_SIZE=""
 ALLOW_DNF=""
+STOP_OTHERS=""
+OPT_NEW_SESSION=""
+OPT_SESSION_ID=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --agent)       AGENT="$2"; shift 2 ;;
-    --base-hash)   OPT_BASE_HASH="$2"; shift 2 ;;
-    --tool-hash)   OPT_TOOL_HASH="$2"; shift 2 ;;
-    --agent-hash)  OPT_AGENT_HASH="$2"; shift 2 ;;
-    --force-pull)  FORCE_PULL=1; shift ;;
-    --image)       BASE_IMAGE="$2"; shift 2 ;;
-    --cpus)        MACHINE_CPUS="$2"; shift 2 ;;
-    --memory)      MACHINE_MEMORY="$2"; shift 2 ;;
-    --disk-size)   MACHINE_DISK_SIZE="$2"; shift 2 ;;
-    --allow-dnf)   ALLOW_DNF=1; shift ;;
+    --agent)        AGENT="$2"; shift 2 ;;
+    --base-hash)    OPT_BASE_HASH="$2"; shift 2 ;;
+    --tool-hash)    OPT_TOOL_HASH="$2"; shift 2 ;;
+    --agent-hash)   OPT_AGENT_HASH="$2"; shift 2 ;;
+    --force-pull)   FORCE_PULL=1; shift ;;
+    --machine-image) MACHINE_IMAGE="$2"; shift 2 ;;
+    --cpus)         MACHINE_CPUS="$2"; shift 2 ;;
+    --memory)       MACHINE_MEMORY="$2"; shift 2 ;;
+    --disk-size)    MACHINE_DISK_SIZE="$2"; shift 2 ;;
+    --allow-dnf)    ALLOW_DNF=1; shift ;;
+    --stop-others)  STOP_OTHERS=1; shift ;;
+    --new-session)  OPT_NEW_SESSION=1; shift ;;
+    --session)      OPT_SESSION_ID="$2"; shift 2 ;;
     --log-level)
       case "$2" in
         I|i) LOG_LEVEL=I ;;
@@ -41,11 +47,44 @@ while [ $# -gt 0 ]; do
   esac
 done
 : "${LOG_LEVEL:=W}"
-MACHINE_ARGS=""
-[ -n "$MACHINE_CPUS" ]      && MACHINE_ARGS="$MACHINE_ARGS --cpus $MACHINE_CPUS"
-[ -n "$MACHINE_MEMORY" ]    && MACHINE_ARGS="$MACHINE_ARGS --memory $MACHINE_MEMORY"
-[ -n "$MACHINE_DISK_SIZE" ] && MACHINE_ARGS="$MACHINE_ARGS --disk-size $MACHINE_DISK_SIZE"
-[ -n "$BASE_IMAGE" ]        && MACHINE_ARGS="$MACHINE_ARGS --image $BASE_IMAGE"
+if [ -n "$OPT_NEW_SESSION" ] && [ -n "$OPT_SESSION_ID" ]; then
+  log E launcher arg-parse "--new-session and --session are mutually exclusive"
+  exit 1
+fi
+
+# Podman parses `-v/--volume "src:dst[:opts]"` by colon — a host path
+# containing `:` (legal on Linux/macOS) silently re-routes the mount or
+# breaks the launch. The native POSIX backends interpolate $PWD into
+# the volume string directly, so reject upfront with a clear message
+# rather than letting Podman produce a cryptic mid-bootstrap error.
+case "$PWD" in
+  *:*) log E launcher fail "working directory '$PWD' contains ':' — Podman uses ':' as the volume source/destination separator. Move the project to a path without colons (or run from a path without colons) and retry."; exit 1 ;;
+esac
+# Build as an argv array (not a shell string) so values containing
+# whitespace or shell metacharacters can't be re-split or inject extra
+# Podman flags when expanded into `podman machine init`.
+MACHINE_ARGS=()
+[ -n "$MACHINE_CPUS" ]      && MACHINE_ARGS+=(--cpus "$MACHINE_CPUS")
+[ -n "$MACHINE_MEMORY" ]    && MACHINE_ARGS+=(--memory "$MACHINE_MEMORY")
+[ -n "$MACHINE_DISK_SIZE" ] && MACHINE_ARGS+=(--disk-size "$MACHINE_DISK_SIZE")
+# `podman machine init --image` takes a Podman *machine* image
+# (path/URL to a disk image like a FCOS qcow2/raw, or `testing`/`stable`
+# stream label), NOT a container image reference like `fedora:latest`
+# — those would fail with "no such image". Hence a dedicated flag,
+# distinct from the container/WSL `--image` that selects a base OS
+# container image.
+[ -n "$MACHINE_IMAGE" ]     && MACHINE_ARGS+=(--image "$MACHINE_IMAGE")
+
+# State dir: each launch writes "<MACHINE_NAME>.machine" containing
+# `pid`, `start` (process start time), and `cmd` (cmdline) as KV lines,
+# then deletes it on exit. A future launch reclaims any machine whose
+# owner is no longer the same live process — pid alone is insufficient
+# on long-uptime hosts where the OS can wrap the pid space and leave
+# the recorded pid in use by an unrelated process. The 3-field tuple
+# (pid + start + cmd) is unique per process lifetime, mirroring the
+# session-owner liveness check in lib/init-launcher.sh.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/crate/machines"
+mkdir -p "$STATE_DIR"
 
 MACHINE_NAME=""
 trap '
@@ -60,7 +99,9 @@ trap '
       sleep 1
     done
     if podman machine inspect "$MACHINE_NAME" >/dev/null 2>&1; then
-      log E vm leak "$MACHINE_NAME still present after 3 rm attempts; manual cleanup required (check ~/.local/share/containers/podman/machine/ and ~/.config/containers/podman/machine/)"
+      log E vm leak "$MACHINE_NAME still present after 3 rm attempts; state file preserved at $STATE_DIR/$MACHINE_NAME.machine for next-launch reclaim. Manual cleanup may be required (check ~/.local/share/containers/podman/machine/ and ~/.config/containers/podman/machine/)"
+    else
+      rm -f "$STATE_DIR/$MACHINE_NAME.machine" 2>/dev/null || true
     fi
   fi
 ' EXIT
@@ -87,59 +128,96 @@ fi
 # ── Runtime VM ──
 
 # Podman supports only one running machine per host (the VM backend
-# binds a fixed gvproxy port). Stop any *other* running machine so this
-# launcher can start its own — but warn loudly so the user knows their
-# unrelated work was interrupted. The current machine has already been
-# stopped above, so any remaining "Running" entries are someone else's.
-stop_all_machines() {
-  podman machine list --format '{{.Name}} {{.Running}}' --noheading 2>/dev/null \
+# binds a fixed gvproxy port). By default fail fast if another machine
+# is running — pass --stop-others to stop them automatically. Avoids
+# silently terminating unrelated user workloads.
+check_running_machines() {
+  _running=$(podman machine list --format '{{.Name}} {{.Running}}' --noheading 2>/dev/null \
     | sed 's/\*//' \
-    | while read -r _name _running; do
-        [ "$_running" = "true" ] || continue
-        log W vm stop-other "stopping running machine '$_name' (podman allows one running machine at a time)"
-        podman machine stop "$_name" 2>/dev/null || true
-      done
+    | awk '$2 == "true" { print $1 }')
+  [ -n "$_running" ] || return 0
+  if [ -n "$STOP_OTHERS" ]; then
+    for _name in $_running; do
+      log W vm stop-other "stopping running machine '$_name' (--stop-others)"
+      podman machine stop "$_name" 2>/dev/null || true
+    done
+  else
+    log E vm conflict "another podman machine is running ($(printf '%s ' $_running| sed 's/ $//')) — podman allows only one at a time. Stop it manually, or pass --stop-others to stop it automatically."
+    exit 1
+  fi
 }
 
-# 128-bit MD5 of $PWD encoded as 22 base62 chars (zero-padded). With the
-# `crate-` prefix the name is 28 chars, under the macOS Podman 30-char cap
-# (driven by the AF_UNIX socket-path budget). bc is required because
-# 128-bit ints exceed POSIX shell arithmetic; awk does the digit→char
-# mapping in the same pipeline so the encoder is a single 3-process
-# pipeline (bc | awk under one $(…)) rather than a per-digit fork loop.
-command -v bc >/dev/null 2>&1 || {
-  log E launcher missing-dep "bc not found; required for machine-name encoding (install via: brew install bc / dnf install bc)"
-  exit 1
+# Reclaim machines whose launcher process is no longer alive (kill -9,
+# power loss, etc.) OR whose pid has been reused by an unrelated
+# process. The marker is a KV file with `pid`, `start`, and `cmd`. A
+# machine is "still owned" iff: pid is alive AND its current start
+# time matches the recorded one AND its current cmdline matches the
+# recorded one. Anything else → abandoned. Legacy markers (single-line
+# pid, no `start=`) fall back to pid-only liveness.
+reclaim_abandoned_machines() {
+  for _f in "$STATE_DIR"/*.machine; do
+    [ -f "$_f" ] || continue
+    _pid=$(_owner_get "$_f" pid)
+    _start=$(_owner_get "$_f" start)
+    _cmd=$(_owner_get "$_f" cmd)
+    # Legacy single-line marker: first line is the pid, no KV pairs.
+    if [ -z "$_pid" ]; then
+      _pid=$(head -n1 "$_f" 2>/dev/null)
+      case "$_pid" in
+        ''|*[!0-9]*) _pid="" ;;
+      esac
+    fi
+    _alive=0
+    if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+      if [ -n "$_start" ]; then
+        _cur_start=$(_pid_start "$_pid")
+        _cur_cmd=$(_pid_cmdline "$_pid")
+        if [ "$_cur_start" = "$_start" ] && [ "$_cur_cmd" = "$_cmd" ]; then
+          _alive=1
+        fi
+      else
+        _alive=1
+      fi
+    fi
+    if [ "$_alive" -eq 0 ]; then
+      _abandoned=$(basename "$_f" .machine)
+      log W vm reclaim "removing abandoned machine '$_abandoned' (owner pid '${_pid:-?}' not alive or PID-reused)"
+      podman machine stop "$_abandoned" 2>/dev/null || true
+      podman machine rm -f "$_abandoned" 2>/dev/null || true
+      # Only drop the marker once the machine is actually gone — otherwise
+      # the next launch would lose its only handle on the leak.
+      if podman machine inspect "$_abandoned" >/dev/null 2>&1; then
+        log E vm reclaim-fail "machine '$_abandoned' still registered after rm; state file preserved at $_f for retry on next launch"
+      else
+        rm -f "$_f"
+      fi
+    fi
+  done
 }
-_hex=$(md5 "$PWD" | tr 'a-f' 'A-F')
-case "$_hex" in
-  [0-9A-F]*[0-9A-F]) ;;
-  *) log E launcher hash-fail "md5(\"\$PWD\") returned no/garbage hex (got: '$_hex'); check ulimit -n (need >256)"; exit 1 ;;
-esac
-WORKDIR_HASH=$(bc <<EOF | awk '
-BEGIN { b62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"; out = "" }
-      { out = substr(b62, $1 + 1, 1) out }
-END   { while (length(out) < 22) out = "0" out; print out }
-'
-ibase=16
-n=$_hex
-ibase=A
-while (n > 0) { n % 62; n = n / 62 }
-EOF
-)
-case "$WORKDIR_HASH" in
-  0000000000000000000000)
-    log E launcher hash-fail "encoder produced all-zero hash (bc/awk pipeline failed silently); check ulimit -n"
-    exit 1 ;;
-esac
-MACHINE_NAME="crate-$WORKDIR_HASH"
 
-podman machine stop "$MACHINE_NAME" 2>/dev/null || true
-podman machine rm -f "$MACHINE_NAME" 2>/dev/null || true
-stop_all_machines
+# Reuse the launcher's resolved SESSION_ID (8 chars base36, set by
+# init_launcher → resolve_session_id) as the VM identity. Format:
+# `crate-<agent>-<sessionId>`. Budget under macOS Podman's 30-char cap
+# (AF_UNIX socket path):
+#   crate- (6) + agent (≤6) + - (1) + 8 = 21 chars (claude/gemini/codex).
+MACHINE_NAME="crate-$AGENT-$SESSION_ID"
+
+reclaim_abandoned_machines
+check_running_machines
+
+# Register this machine before init: if init/start fails, the trap will
+# remove the half-created machine AND this state file together. KV
+# format with pid + start + cmd so a future launch can detect both
+# kill-9 leaks and PID-reuse on long-uptime hosts. cmd is collapsed to
+# a single line so the awk-based KV parser stays valid.
+{
+  printf 'pid=%s\n'   "$$"
+  printf 'start=%s\n' "$(_pid_start "$$")"
+  printf 'cmd=%s\n'   "$(_pid_cmdline "$$" | tr '\n' ' ')"
+} > "$STATE_DIR/$MACHINE_NAME.machine"
 
 log I vm init "$MACHINE_NAME"
-podman machine init "$MACHINE_NAME" $MACHINE_ARGS \
+podman machine init "$MACHINE_NAME" ${MACHINE_ARGS[@]+"${MACHINE_ARGS[@]}"} \
   --volume "$PWD:/var/workdir"
 log I vm start "$MACHINE_NAME"
 podman machine start "$MACHINE_NAME"
@@ -147,13 +225,14 @@ podman machine start "$MACHINE_NAME"
 # Stage log.sh to the canonical in-sandbox path (baked into the image on
 # container/WSL backends; absent on Fedora CoreOS — must be installed here
 # before any bin/*.sh that sources it runs).
+#
+# All shell files streamed below are filtered through `tr -d '\r'` so a
+# Windows checkout with `core.autocrlf=true` doesn't ship CRLF into the
+# guest where bash chokes on the carriage returns. Archive transfers in
+# the for-loop below are intentionally NOT filtered (binary .tar.xz).
 log I vm setup "installing log.sh"
-cat "$PROJECT_ROOT/lib/log.sh" | podman machine ssh "$MACHINE_NAME" \
+tr -d '\r' < "$PROJECT_ROOT/lib/log.sh" | podman machine ssh "$MACHINE_NAME" \
   'sudo install -d -m 0755 /usr/local/lib/crate && sudo tee /usr/local/lib/crate/log.sh >/dev/null && sudo chmod 0644 /usr/local/lib/crate/log.sh'
-
-log I mounts assemble "$CRATE_DIR"
-cat "$PROJECT_ROOT/bin/setup-system-mounts.sh" | podman machine ssh "$MACHINE_NAME" \
-  'cat > /tmp/setup-system-mounts.sh && chmod +x /tmp/setup-system-mounts.sh'
 
 # Encode each file list as base64 of NUL-delimited UTF-8 so filenames
 # with quotes/spaces/newlines/metachars survive both the SSH command-
@@ -166,26 +245,44 @@ _encode_nul_b64() {
 _CF_B64=$(_encode_nul_b64 ${CONFIG_FILES[@]+"${CONFIG_FILES[@]}"})
 _RF_B64=$(_encode_nul_b64 ${RO_FILES[@]+"${RO_FILES[@]}"})
 _RD_B64=$(_encode_nul_b64 ${RO_DIRS[@]+"${RO_DIRS[@]}"})
-podman machine ssh "$MACHINE_NAME" \
-  "sudo /tmp/setup-system-mounts.sh \
+
+# Stream the script over ssh stdin into `sudo sh -s --` rather than
+# staging at a predictable /tmp/<name>.sh path. Eliminates the
+# pre-create-symlink window that an attacker with concurrent VM access
+# would have between `cat > /tmp/X.sh` and the subsequent invocation.
+log I mounts assemble "$CRATE_DIR"
+tr -d '\r' < "$PROJECT_ROOT/bin/setup-system-mounts.sh" | podman machine ssh "$MACHINE_NAME" \
+  "sudo bash -s -- \
      --log-level ${LOG_LEVEL:-W} \
      --workdir /var/workdir \
      --project-dir '$AGENT_PROJECT_DIR' \
+     --session-id '$SESSION_ID' \
      --target '$CRATE_DIR' \
      --config-files '$_CF_B64' \
      --ro-files '$_RF_B64' \
      --ro-dirs '$_RD_B64'"
 
 log I archive inject "base+tool+$AGENT tarballs"
-cat "$PROJECT_ROOT/bin/setup-tools.sh" | podman machine ssh "$MACHINE_NAME" \
-  'cat > /tmp/setup-tools.sh && chmod +x /tmp/setup-tools.sh'
+# Each archive gets a fresh mktemp'd path inside the VM (random suffix,
+# O_EXCL semantics) so a concurrent VM-side process can't pre-place a
+# symlink at the path. setup-tools.sh treats archives as positional
+# args and uses tar's content-based detection — the random name is
+# fine.
 _ARCHIVE_ARGS=""
 for _archive in "$BASE_ARCHIVE" "$TOOL_ARCHIVE" "$AGENT_ARCHIVE"; do
-  _name=$(basename "$_archive")
-  cat "$_archive" | podman machine ssh "$MACHINE_NAME" "cat > /tmp/$_name"
-  _ARCHIVE_ARGS="$_ARCHIVE_ARGS /tmp/$_name"
+  _remote_path=$(cat "$_archive" | podman machine ssh "$MACHINE_NAME" \
+    'p=$(mktemp /tmp/archive.XXXXXXXX) && cat > "$p" && printf "%s" "$p"')
+  if [ -z "$_remote_path" ]; then
+    log E launcher fail "failed to stage $(basename "$_archive") in VM"
+    exit 1
+  fi
+  _ARCHIVE_ARGS="$_ARCHIVE_ARGS $_remote_path"
 done
-podman machine ssh "$MACHINE_NAME" "/tmp/setup-tools.sh --log-level ${LOG_LEVEL:-W}$_ARCHIVE_ARGS"
+# setup-tools.sh streams over ssh stdin into `sh -s --`, same pattern
+# as setup-system-mounts.sh above. Archives are referenced by their
+# mktemp'd paths via $_ARCHIVE_ARGS.
+tr -d '\r' < "$PROJECT_ROOT/bin/setup-tools.sh" | podman machine ssh "$MACHINE_NAME" \
+  "sh -s -- --log-level ${LOG_LEVEL:-W}$_ARCHIVE_ARGS"
 
 # Install enable-dnf + the per-user bootstrap sudoers rule. Container/
 # WSL backends bake these into the image (Containerfile lines 18-24);
@@ -193,9 +290,9 @@ podman machine ssh "$MACHINE_NAME" "/tmp/setup-tools.sh --log-level ${LOG_LEVEL:
 # per-user sudoers rule survives the strip-sudo step below — group
 # membership and per-user rules are independent in sudoers.
 log I vm install-dnf "enable-dnf + sudoers rule for core"
-cat "$PROJECT_ROOT/bin/enable-dnf.sh" | podman machine ssh "$MACHINE_NAME" \
+tr -d '\r' < "$PROJECT_ROOT/bin/enable-dnf.sh" | podman machine ssh "$MACHINE_NAME" \
   'sudo tee /usr/local/lib/crate/enable-dnf >/dev/null && sudo chmod 0755 /usr/local/lib/crate/enable-dnf'
-sed 's|__USER__|core|g' "$PROJECT_ROOT/config/sudoers-enable-dnf.tmpl" | podman machine ssh "$MACHINE_NAME" \
+sed 's|__USER__|core|g; s|\r$||' "$PROJECT_ROOT/config/sudoers-enable-dnf.tmpl" | podman machine ssh "$MACHINE_NAME" \
   'sudo tee /etc/sudoers.d/core-enable-dnf >/dev/null && sudo chmod 0440 /etc/sudoers.d/core-enable-dnf && sudo visudo -cf /etc/sudoers.d/core-enable-dnf'
 
 # Strip core of sudo/wheel group membership so the agent (which runs
@@ -205,8 +302,10 @@ sed 's|__USER__|core|g' "$PROJECT_ROOT/config/sudoers-enable-dnf.tmpl" | podman 
 # /etc/group at login. The per-user sudoers rule installed above
 # stays in effect (sudoers per-user rules don't depend on group).
 log I vm strip-sudo "dropping core from sudo/wheel"
-cat "$PROJECT_ROOT/bin/bootstrap-agent-user.sh" | podman machine ssh "$MACHINE_NAME" \
-  'cat > /tmp/bootstrap-agent-user.sh && chmod +x /tmp/bootstrap-agent-user.sh && sudo /tmp/bootstrap-agent-user.sh'
+# Stream over ssh stdin into `sudo sh -s --`; same pattern as the
+# other setup scripts — no temp file at a predictable /tmp/ path.
+tr -d '\r' < "$PROJECT_ROOT/bin/bootstrap-agent-user.sh" | podman machine ssh "$MACHINE_NAME" \
+  'sudo sh -s --'
 
 # ── Launch ──
 

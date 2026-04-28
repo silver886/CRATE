@@ -19,33 +19,40 @@ set -eu
 . /usr/local/lib/crate/log.sh
 
 LAUNCH=""
-_ARCHIVES=""
-_ARCHIVE_COUNT=0
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --exec) LAUNCH=1; shift ;;
+# Rotate-based parser: options can appear anywhere among the positional
+# args. Two callers feed us with different orderings:
+#   - Containerfile ENTRYPOINT: --exec, archives..., then launcher appends
+#     --log-level X to the end (`podman run … $imageTag --log-level I`).
+#   - wsl.ps1 / podman-machine.sh: --log-level X first, then archives.
+# We iterate exactly $# times, consuming options at the front and re-
+# appending positional args to the back; after the loop "$@" holds only
+# the archive paths in original order. Preserves spaces in paths
+# verbatim because each $1 is treated as a single token, never re-split.
+n=$#
+while [ "$n" -gt 0 ]; do
+  arg=$1; shift; n=$((n - 1))
+  case "$arg" in
+    --exec) LAUNCH=1 ;;
     --log-level)
-      case "${2:-}" in
+      case "${1:-}" in
         I|i) LOG_LEVEL=I ;;
         W|w) LOG_LEVEL=W ;;
         E|e) LOG_LEVEL=E ;;
-        *) log E archive arg-parse "invalid --log-level: ${2:-} (want I, W, or E)"; exit 1 ;;
+        *) log E archive arg-parse "invalid --log-level: ${1:-} (want I, W, or E)"; exit 1 ;;
       esac
-      shift 2
+      shift; n=$((n - 1))
       ;;
-    *) _ARCHIVES="$_ARCHIVES $1"; _ARCHIVE_COUNT=$((_ARCHIVE_COUNT + 1)); shift ;;
+    *) set -- "$@" "$arg" ;;
   esac
 done
 : "${LOG_LEVEL:=W}"
 
 BIN_DIR="${AGENT_BIN_DIR:-$HOME/.local/bin}"
 LIB_DIR="${AGENT_LIB_DIR:-$HOME/.local/lib}"
-log I archive extract "$BIN_DIR ($_ARCHIVE_COUNT archives)"
+log I archive extract "$BIN_DIR ($# archives)"
 mkdir -p "$BIN_DIR" "$LIB_DIR"
 
-# Unquoted expansion intentional: $_ARCHIVES is a space-separated list
-# of archive paths (all under the cache dir, no spaces in practice).
-for archive in $_ARCHIVES; do
+for archive in "$@"; do
   tar --xz -xf "$archive" -C "$BIN_DIR/"
 done
 

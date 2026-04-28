@@ -11,7 +11,7 @@
     "ro":     ["GEMINI.md"],
     "roDirs": ["extensions", "commands", "policies"]
   },
-  "credential": { "strategy": "oauth-google" },
+  "credential": { "strategy": "oauth-google", "file": "oauth_creds.json" },
   "executable": {
     "type":           "node-bundle",
     "versionPackage": "@google/gemini-cli",

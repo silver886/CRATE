@@ -24,7 +24,7 @@
 # LOG_LEVEL is NEVER injected as an env var (--env / env VAR=…).
 # Every process boundary uses an explicit --log-level arg:
 #
-#   Ensure-Credential.ps1  & ./lib/Ensure-Credential.ps1 -LogLevel $script:LogLevel
+#   Ensure-Credential.ps1  & ./script/Ensure-Credential.ps1 -LogLevel $script:LogLevel
 #   podman container       setup-tools.sh parses --log-level from CMD tail
 #   wsl -u root            sh $wslSetup --log-level $LogLevel …
 #   sudo (in sandbox)      enable-dnf.sh --log-level $LOG_LEVEL

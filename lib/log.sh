@@ -68,7 +68,7 @@ fi
 # `--env` / `env VAR=…`. Every process boundary uses an explicit
 # `--log-level X` arg so the env is never polluted:
 #
-#   ensure-credential.sh   ./lib/ensure-credential.sh --log-level $LOG_LEVEL
+#   ensure-credential.sh   ./script/ensure-credential.sh --log-level $LOG_LEVEL
 #   podman container       setup-tools.sh parses --log-level from CMD tail
 #   podman machine ssh     /tmp/setup-tools.sh --log-level $LOG_LEVEL …
 #   wsl -u root            sh $wslSetup --log-level $LogLevel …
