@@ -11,6 +11,7 @@
     "ro":     ["GEMINI.md"],
     "roDirs": ["extensions", "commands", "policies"]
   },
+  "trustedSymlinkRoots": ["$HOME/.config/gemini-cli"],
   "credential": { "strategy": "oauth-google", "file": "oauth_creds.json" },
   "executable": {
     "type":           "node-bundle",

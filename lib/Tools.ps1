@@ -551,14 +551,22 @@ $buildToolArchives = {
       $script:baseArchive = & $resolveArchive 'base' $optBaseHash
     }
     else {
-      $baseHash = & $sha256 "base-node:$nodeVer-rg:$rgVer-micro:$microVer"
+      # arch:$arch in the seed because the packed binaries (node, rg,
+      # micro) are architecture-specific. Without it, an x64 and an
+      # arm64 host sharing $toolsDir (a roaming-profile cache, an Apple
+      # Silicon dev switching between Rosetta and native, CI matrix
+      # with a shared build cache) collide on the same `base-*.tar.xz`
+      # filename and inject the wrong binaries. Matches the agent-tier
+      # seed below which already includes $arch.
+      $baseHash = & $sha256 "base-arch:$($script:arch)-node:$nodeVer-rg:$rgVer-micro:$microVer"
       $script:baseArchive = "$toolsDir\base-$baseHash.tar.xz"
     }
     if ($optToolHash) {
       $script:toolArchive = & $resolveArchive 'tool' $optToolHash
     }
     else {
-      $toolHash = & $sha256 "tool-pnpm:$pnpmVer-uv:$uvVer"
+      # Same arch:$arch rationale as base-tier above.
+      $toolHash = & $sha256 "tool-arch:$($script:arch)-pnpm:$pnpmVer-uv:$uvVer"
       $script:toolArchive = "$toolsDir\tool-$toolHash.tar.xz"
     }
     # Compute the generated agent-manifest.sh up front — used both in the

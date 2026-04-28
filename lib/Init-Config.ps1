@@ -21,33 +21,36 @@
 #                                          owner.pid/owner.cmd are still read as a fallback)
 
 # Assert a symlink-resolved path stays under a trusted root: the
-# canonical agent config dir ($script:realConfigDir) OR the user's
-# $HOME ($script:realHomeDir). C:\Windows\System32\config\... and
-# /etc/passwd targets still fail; a symlink in scoop's persist dir to
-# ~/.config/<agent>/.credentials.json (or any cross-tool layout where
-# the user has linked across their own profile) succeeds. Run after
-# every ResolveLinkTarget / GetFullPath. Trim trailing separators on
-# both sides so '/' vs '/*' comparisons aren't confused by path style
-# differences across platforms. Comparison is OrdinalIgnoreCase so
-# NTFS's case-insensitive semantics don't cause a 'C:\Users\LL' vs
-# 'C:\Users\ll' mismatch.
+# canonical agent config dir ($script:realConfigDir), or any path
+# declared in the manifest's `trustedSymlinkRoots` array (canonicalised
+# in Agent.ps1 → $script:agentTrustedRoots). C:\Windows\..., /etc/...,
+# ~/.ssh, browser tokens etc. all fail by default — the previous
+# blanket "all of $HOME" widening let an LLM agent with write access
+# to its own config dir plant a junction to any home-resident secret
+# and have it staged into the next session. See code-review-handoff.md
+# CR-001. To re-enable a known cross-app layout (scoop persist, etc.),
+# declare it explicitly in the agent manifest.
+#
+# Trim trailing separators so '/' vs '/*' comparisons aren't confused
+# by path style differences across platforms. Comparison is
+# OrdinalIgnoreCase so NTFS's case-insensitive semantics don't cause
+# a 'C:\Users\LL' vs 'C:\Users\ll' mismatch on Windows.
 $assertUnderConfig = { param($real, $orig)
-  # `$home` is reserved (read-only PS automatic var, case-insensitive), so
-  # use `$userHome` for the local copy of $script:realHomeDir.
   $cmp = $real.TrimEnd('/', '\')
-  $root = $script:realConfigDir
-  $userHome = $script:realHomeDir
   $oic = [StringComparison]::OrdinalIgnoreCase
   $under = {
     param($p)
+    if (-not $p) { return $false }
     [string]::Equals($cmp, $p, $oic) -or
       $cmp.StartsWith($p + '/', $oic) -or
       $cmp.StartsWith($p + '\', $oic)
   }
-  if (-not ((& $under $root) -or (& $under $userHome))) {
-    Write-Log E config fail "manifest entry resolves outside trusted dirs: $orig -> $real (must stay under $root or `$HOME=$userHome)"
-    throw "manifest entry escapes trusted dirs: $orig"
+  if (& $under $script:realConfigDir) { return }
+  foreach ($trusted in $script:agentTrustedRoots) {
+    if (& $under $trusted) { return }
   }
+  Write-Log E config fail "manifest entry resolves outside trusted dirs: $orig -> $real (must stay under $($script:realConfigDir) or a manifest-declared trustedSymlinkRoots entry)"
+  throw "manifest entry escapes trusted dirs: $orig"
 }
 
 $stageRoFile = { param($src, $dest)
@@ -86,7 +89,24 @@ $resolveDir = { param($path)
 # stage. Each entry's resolved path is gated against the agent
 # config root so a junction/symlink to e.g. C:\Windows or /etc can't
 # stage host secrets through the sandbox.
-$copyRoDir = { param($src, $dest)
+#
+# $visited threads a HashSet[string] of canonical real-paths we've
+# entered through the recursion so a junction/symlink loop within
+# the config dir (e.g. `rules/loop -> ..` — passes containment
+# because the target is still inside the config dir) doesn't
+# stack-overflow. Bash side gets this for free from `find -L`'s
+# POSIX-required loop detection; the Windows path needs explicit
+# tracking.
+#
+# Comparer is OrdinalIgnoreCase: NTFS / drvfs are case-insensitive,
+# so `C:\Foo` and `C:\foo` are the same target — case-sensitive
+# matching would miss that cycle. On a case-sensitive volume the
+# trade is over-detection (skip a legit non-cycle that differs only
+# in case → a content-staging miss, recoverable) vs under-detection
+# (stack overflow → process crash, not recoverable). Fail toward
+# the safer mode.
+$copyRoDir = { param($src, $dest, $visited)
+  if (-not $visited.Add($src)) { return }
   [IO.Directory]::CreateDirectory($dest) > $null
   foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($src)) {
     $name = [IO.Path]::GetFileName($entry)
@@ -94,7 +114,7 @@ $copyRoDir = { param($src, $dest)
     if ([IO.Directory]::Exists($entry)) {
       $realSub = & $resolveDir $entry
       & $assertUnderConfig $realSub $entry
-      & $copyRoDir $realSub $out
+      & $copyRoDir $realSub $out $visited
     }
     else {
       # $stageRoFile validates the file's real path is under config dir.
@@ -125,31 +145,28 @@ $initConfigDir = {
   }
   $script:realConfigDir = $script:realConfigDir.TrimEnd('/', '\')
 
-  # $HOME's canonical form widens the trust zone for $assertUnderConfig.
-  # User-resident files (~/.config/<agent>/..., scoop persist dirs that
-  # symlink across the profile, etc.) are part of the user's own trust
-  # boundary; a symlink in the config dir to C:\Windows\System32\... is
-  # still rejected. PowerShell's $HOME is %USERPROFILE% on Windows. If
-  # $HOME is empty or a filesystem root (degenerate case), collapse to
-  # the config dir so the home branch in $assertUnderConfig doesn't
-  # match every absolute path and defeat the gate.
-  $homeInfo = [IO.Directory]::ResolveLinkTarget($HOME, $true)
-  $script:realHomeDir = if ($homeInfo) {
-    $homeInfo.FullName
-  }
-  else {
-    [IO.Path]::GetFullPath($HOME)
-  }
-  $script:realHomeDir = $script:realHomeDir.TrimEnd('/', '\')
-  if (-not $script:realHomeDir -or $script:realHomeDir -match '^[A-Za-z]:?$') {
-    $script:realHomeDir = $script:realConfigDir
-  }
-
   $script:systemDir = [IO.Path]::Combine($PWD.Path, $agentProjectDir, '.system')
 
-  $gitPath = [IO.Path]::Combine($PWD.Path, '.git')
-  $gi = [IO.Path]::Combine($PWD.Path, '.gitignore')
-  if ([IO.Directory]::Exists($gitPath) -or [IO.File]::Exists($gitPath)) {
+  # Walk upward from $PWD to find the repo top-level: the launcher may
+  # run from a subdir of a larger repo (e.g. C:\repo\subproj\), in which
+  # case `.system\` is still commit-visible from the parent and the
+  # warning must still fire. The previous `$PWD\.git` check missed that.
+  # `.git` matches both regular repos (directory) and worktrees /
+  # submodules (regular file pointer). See code-review-handoff.md CR-003.
+  $gitTop = $null
+  $walk = $PWD.Path
+  while ($walk) {
+    $candidate = [IO.Path]::Combine($walk, '.git')
+    if ([IO.Directory]::Exists($candidate) -or [IO.File]::Exists($candidate)) {
+      $gitTop = $walk
+      break
+    }
+    $parent = [IO.Path]::GetDirectoryName($walk)
+    if ([string]::IsNullOrEmpty($parent) -or $parent -eq $walk) { break }
+    $walk = $parent
+  }
+  if ($gitTop) {
+    $gi = [IO.Path]::Combine($gitTop, '.gitignore')
     $hasMatch = $false
     if ([IO.File]::Exists($gi)) {
       $pattern = '(?m)^\s*/?' + [regex]::Escape($agentProjectDir) + '(/(\.system)?/?)?\s*$'
@@ -210,7 +227,12 @@ $initConfigDir = {
     $realSrcDir = & $resolveDir $srcDir
     & $assertUnderConfig $realSrcDir $d
     $script:roDirs.Add($d)
-    & $copyRoDir $realSrcDir ([IO.Path]::Combine($stageRo, $d))
+    # Fresh visited-set per top-level roDirs entry so two unrelated
+    # entries don't share state (an unlikely but real concern: if `rules`
+    # and `commands` are siblings, walking `rules` shouldn't pre-block
+    # `commands`).
+    $visited = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    & $copyRoDir $realSrcDir ([IO.Path]::Combine($stageRo, $d)) $visited
   }
 
   $crPlaceholders = @($script:configFiles) + @($script:roFiles)

@@ -11,6 +11,7 @@
     "ro":     ["CLAUDE.md", "keybindings.json"],
     "roDirs": ["rules", "commands", "agents", "output-styles", "skills"]
   },
+  "trustedSymlinkRoots": ["$HOME/.config/claude-code"],
   "credential": { "strategy": "oauth-anthropic", "file": ".credentials.json" },
   "executable": {
     "type":           "platform-binary",

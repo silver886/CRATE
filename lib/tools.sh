@@ -602,13 +602,23 @@ build_tool_archives() {
   if [ -n "${OPT_BASE_HASH:-}" ]; then
     BASE_ARCHIVE=$(resolve_archive "base" "$OPT_BASE_HASH")
   else
-    BASE_HASH=$(sha256 "base-node:$NODE_VER-rg:$RG_VER-micro:$MICRO_VER")
+    # arch:$ARCH in the seed because the packed binaries (node, rg,
+    # micro) are architecture-specific. Without it, an x64 and an arm64
+    # host sharing $TOOLS_DIR (NAS-mounted cache, Apple Silicon dev
+    # switching between Rosetta and native, CI matrix with a shared
+    # build cache) collide on the same `base-*.tar.xz` filename and
+    # inject the wrong binaries — the agent then fails to exec with an
+    # opaque ELF/Mach-O error. Matches the agent-tier seed below which
+    # already includes $ARCH.
+    BASE_HASH=$(sha256 "base-arch:$ARCH-node:$NODE_VER-rg:$RG_VER-micro:$MICRO_VER")
     BASE_ARCHIVE="$TOOLS_DIR/base-$BASE_HASH.tar.xz"
   fi
   if [ -n "${OPT_TOOL_HASH:-}" ]; then
     TOOL_ARCHIVE=$(resolve_archive "tool" "$OPT_TOOL_HASH")
   else
-    TOOL_HASH=$(sha256 "tool-pnpm:$PNPM_VER-uv:$UV_VER")
+    # Same arch:$ARCH rationale as base-tier above — pnpm and uv are
+    # arch-specific binaries.
+    TOOL_HASH=$(sha256 "tool-arch:$ARCH-pnpm:$PNPM_VER-uv:$UV_VER")
     TOOL_ARCHIVE="$TOOLS_DIR/tool-$TOOL_HASH.tar.xz"
   fi
   if [ -n "${OPT_AGENT_HASH:-}" ]; then

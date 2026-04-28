@@ -12,6 +12,13 @@
 #   $crateEnv           — env var name the wrapper sets inside the sandbox
 #                         to point at $crateDir; empty if the agent
 #                         has no config-dir env var (Gemini)
+#   $agentTrustedRoots  — List[string] of canonical absolute paths that
+#                         resolved symlink targets may land under, in
+#                         addition to $agentConfigDir. Sourced from the
+#                         manifest's optional `trustedSymlinkRoots`
+#                         array (each entry must be '$HOME/...' or
+#                         absolute, with no '..' segments, and
+#                         canonicalise under $HOME).
 #
 # Sandbox-side path policy (see lib/agent.sh for the rationale):
 #   - With configDir.env present, stage at /usr/local/etc/crate/<agent>
@@ -140,7 +147,15 @@ function Invoke-AgentLoad {
   # normally-shell-sensitive characters in absolute paths (e.g.
   # 'C:\Users\Jane Doe\.claude') are safe to allow. Traversal is
   # already collapsed by GetFullPath.
-  if (-not $canon -or $canon -match '^[A-Za-z]:$') {
+  #
+  # Three explicit branches matching `lib/agent.sh`'s `[ -z "$_canon" ]
+  # || [ "$_canon" = "/" ]` form: empty string (canonicalisation
+  # produced nothing usable), POSIX root (`/`), and Windows drive root
+  # (`C:` post-TrimEnd). The `-eq '/'` clause is currently unreachable
+  # via TrimEnd above but kept as parity with the bash check so a
+  # future TrimEnd refactor can't silently regress Unix-side
+  # protection.
+  if ([string]::IsNullOrEmpty($canon) -or $canon -eq '/' -or $canon -match '^[A-Za-z]:$') {
     Write-Log E launcher fail "agent config dir resolves to filesystem root: $($script:agentConfigDir)"
     throw "agent config dir resolves to filesystem root"
   }
@@ -173,6 +188,101 @@ function Invoke-AgentLoad {
   # ambiguity in later prefix checks (e.g. $assertUnderConfig in
   # Init-Config.ps1).
   $script:agentConfigDir = $canon
+
+  # Optional manifest list of additional canonical roots that resolved
+  # symlink targets may land under, beyond $agentConfigDir. Use case:
+  # scoop on Windows, where %USERPROFILE%\.config\<agent>\... is a
+  # junction to %USERPROFILE%\scoop\persist\<agent>\... See lib/agent.sh
+  # for the full rationale. Default (empty) is the strictest containment;
+  # the manifest opts in to specific cross-app anchors. Each entry must
+  # be absolute or '$HOME/...' and canonicalise under $HOME so a hostile
+  # manifest can't anchor trust in C:\Windows or /etc.
+  $script:agentTrustedRoots = [Collections.Generic.List[string]]::new()
+  $rawRoots = @()
+  if ($script:agentManifest.PSObject.Properties.Name -contains 'trustedSymlinkRoots' -and
+      $null -ne $script:agentManifest.trustedSymlinkRoots) {
+    $rawRoots = [string[]](@($script:agentManifest.trustedSymlinkRoots))
+  }
+  $homeForTrust = [IO.Path]::GetFullPath($HOME)
+  if ([IO.Directory]::Exists($homeForTrust)) {
+    $homeLink = [IO.Directory]::ResolveLinkTarget($homeForTrust, $true)
+    if ($homeLink) { $homeForTrust = $homeLink.FullName }
+  }
+  $homeForTrust = $homeForTrust.TrimEnd('/', '\')
+  if ([string]::IsNullOrEmpty($homeForTrust) -or $homeForTrust -match '^[A-Za-z]:$') {
+    $homeForTrust = ''
+  }
+  foreach ($entry in $rawRoots) {
+    if ($entry -isnot [string] -or [string]::IsNullOrEmpty($entry)) {
+      Write-Log E launcher fail "trustedSymlinkRoots entry must be a non-empty string"
+      throw "invalid trustedSymlinkRoots entry"
+    }
+    if ($entry -match '[\x00-\x1f]') {
+      Write-Log E launcher fail "trustedSymlinkRoots entry contains control char: $entry"
+      throw "invalid trustedSymlinkRoots entry"
+    }
+    foreach ($seg in $entry.Split('/')) {
+      if ($seg -eq '..') {
+        Write-Log E launcher fail "trustedSymlinkRoots entry contains '..' segment: $entry"
+        throw "invalid trustedSymlinkRoots entry"
+      }
+    }
+    if ($entry.StartsWith('$HOME/', [StringComparison]::Ordinal)) {
+      $expanded = $HOME + $entry.Substring('$HOME'.Length)
+    }
+    elseif ($entry.StartsWith('/') -or $entry -match '^[A-Za-z]:[\\/]') {
+      $expanded = $entry
+    }
+    else {
+      Write-Log E launcher fail "trustedSymlinkRoots entry must be absolute or start with '`$HOME/': $entry"
+      throw "invalid trustedSymlinkRoots entry"
+    }
+    try { $expCanon = [IO.Path]::GetFullPath($expanded) } catch {
+      Write-Log E launcher fail "trustedSymlinkRoots entry cannot be canonicalised: $entry"
+      throw "invalid trustedSymlinkRoots entry"
+    }
+    if ([IO.Directory]::Exists($expCanon)) {
+      $rootLink = [IO.Directory]::ResolveLinkTarget($expCanon, $true)
+      if ($rootLink) { $expCanon = $rootLink.FullName }
+    }
+    else {
+      # Walk up to the nearest existing ancestor and re-append the
+      # missing tail — matches agent_load's pattern. A not-yet-installed
+      # scoop persist dir shouldn't fail the launcher; the entry just
+      # won't match any staged target until the dir exists.
+      $tailParts = @()
+      $head = $expCanon
+      while ($head -and -not [IO.Directory]::Exists($head)) {
+        $parent = [IO.Path]::GetDirectoryName($head)
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $head) { break }
+        $tailParts = @([IO.Path]::GetFileName($head)) + $tailParts
+        $head = $parent
+      }
+      if ($head -and [IO.Directory]::Exists($head)) {
+        $headLink = [IO.Directory]::ResolveLinkTarget($head, $true)
+        if ($headLink) { $head = $headLink.FullName }
+        $expCanon = $head
+        foreach ($t in $tailParts) {
+          $expCanon = [IO.Path]::Combine($expCanon, $t)
+        }
+      }
+    }
+    $expCanon = $expCanon.TrimEnd('/', '\')
+    if ([string]::IsNullOrEmpty($expCanon) -or $expCanon -eq '/' -or $expCanon -match '^[A-Za-z]:$') {
+      Write-Log E launcher fail "trustedSymlinkRoots entry resolves to filesystem root: $entry"
+      throw "invalid trustedSymlinkRoots entry"
+    }
+    if ($homeForTrust) {
+      $under = [string]::Equals($expCanon, $homeForTrust, [StringComparison]::OrdinalIgnoreCase) -or
+        $expCanon.StartsWith($homeForTrust + '/', [StringComparison]::OrdinalIgnoreCase) -or
+        $expCanon.StartsWith($homeForTrust + '\', [StringComparison]::OrdinalIgnoreCase)
+      if (-not $under) {
+        Write-Log E launcher fail "trustedSymlinkRoots entry must canonicalise under `$HOME ($homeForTrust): $entry -> $expCanon"
+        throw "invalid trustedSymlinkRoots entry"
+      }
+    }
+    $script:agentTrustedRoots.Add($expCanon)
+  }
 
   $script:crateEnv = $envName
   if ($envName) {

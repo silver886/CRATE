@@ -13,6 +13,13 @@
 #   CRATE_ENV           — name of the env var the wrapper exports inside
 #                         the sandbox to point the agent at CRATE_DIR
 #                         (empty for agents without such an env var)
+#   AGENT_TRUSTED_ROOTS — newline-delimited canonical absolute paths that
+#                         resolved symlink targets may land under, in
+#                         addition to AGENT_CONFIG_DIR. Sourced from the
+#                         manifest's optional `trustedSymlinkRoots` array
+#                         (each entry must be '$HOME/...' or absolute,
+#                         no '..' segments, and canonicalise under
+#                         $HOME). Iterate via IFS=newline.
 #
 # Sandbox-side path policy:
 #   - If the manifest declares configDir.env (Claude CLAUDE_CONFIG_DIR,
@@ -47,6 +54,14 @@ agent_load() {
     log E launcher fail "unknown agent: $AGENT (no $AGENT_MANIFEST)"
     exit 1
   fi
+
+  # Run structural validators upfront. Both files.{rw,ro,roDirs} entries
+  # and trustedSymlinkRoots entries are then known to be safe strings,
+  # which lets the rest of agent_load iterate without fearing embedded
+  # LF/CR/NUL — important because this loader is sourced by both bash
+  # (init-launcher.sh) and POSIX sh (ensure-credential.sh), so the
+  # trusted-roots loop below can't rely on bash-only `read -d ''`.
+  agent_validate_manifest_paths
 
   # Both values flow into host paths, mount targets, and (via
   # AGENT_BINARY) remote shell strings (ssh / sh -c) where SSH/wsl
@@ -193,6 +208,93 @@ agent_load() {
   # init-config.sh).
   AGENT_CONFIG_DIR=$_canon
 
+  # Optional manifest list of additional canonical roots that resolved
+  # symlink targets may land under, in addition to AGENT_CONFIG_DIR.
+  # Use case: scoop on Windows where ~/.config/<agent>/.credentials.json
+  # is a junction to ~/scoop/persist/<agent>/.credentials.json.
+  #
+  # Default (empty list) means "config-root only" — the strictest
+  # containment. The previous policy widened trust to all of $HOME so
+  # that scoop layouts worked, but that also let an LLM agent with
+  # write access to its own config dir plant a symlink to ~/.ssh/id_rsa
+  # (or any other home-resident secret) and have it staged into the
+  # next session. See code-review-handoff.md CR-001.
+  #
+  # Each manifest entry must be absolute or '$HOME/...' (only $HOME
+  # expands), have no '..' segments, and canonicalise under $HOME so a
+  # hostile manifest can't anchor trust in /etc, /var, etc.
+  #
+  # agent_validate_manifest_paths above already verified each entry is
+  # a string, absolute or '$HOME/...', has no '..' segments, and has no
+  # control chars (incl LF/CR). That lets us emit one entry per
+  # LF-delimited line and read with POSIX `while read` — avoiding
+  # bash-only `read -d ''` / `< <(...)` so this block stays POSIX-clean
+  # for ensure-credential.sh. Output is stored in AGENT_TRUSTED_ROOTS,
+  # newline-delimited; init-config.sh iterates with IFS=newline.
+  AGENT_TRUSTED_ROOTS=""
+  _canon_home_for_trust=$(cd -P -- "$HOME" 2>/dev/null && pwd) || _canon_home_for_trust=$HOME
+  case "$_canon_home_for_trust" in
+    ''|/) _canon_home_for_trust="" ;;
+  esac
+  _roots_tmp=$(jq -r '.trustedSymlinkRoots // [] | .[]?' "$AGENT_MANIFEST")
+  _OLD_IFS=$IFS
+  IFS='
+'
+  for _entry in $_roots_tmp; do
+    [ -z "$_entry" ] && continue
+    case "$_entry" in
+      '$HOME/'*) _exp="$HOME${_entry#\$HOME}" ;;
+      /*)        _exp="$_entry" ;;
+      *)
+        IFS=$_OLD_IFS
+        log E launcher fail "trustedSymlinkRoots entry must be absolute or start with '\$HOME/': $_entry"
+        exit 1
+        ;;
+    esac
+    if [ -d "$_exp" ]; then
+      _root_canon=$(cd -P -- "$_exp" 2>/dev/null && pwd) || _root_canon=""
+    else
+      # Match agent_load's walk-up-to-existing-ancestor pattern. A
+      # not-yet-installed scoop persist dir shouldn't fail the launcher;
+      # the entry just won't match any staged symlink target.
+      _h=$_exp; _t=""
+      while [ -n "$_h" ] && [ "$_h" != "/" ] && [ ! -d "$_h" ]; do
+        _seg=${_h##*/}
+        case "$_h" in
+          */*) _h=${_h%/*}; [ -z "$_h" ] && _h=/ ;;
+          *)   _h="" ;;
+        esac
+        if [ -n "$_t" ]; then _t="$_seg/$_t"; else _t=$_seg; fi
+      done
+      if [ -n "$_h" ] && [ -d "$_h" ]; then
+        _h_canon=$(cd -P -- "$_h" 2>/dev/null && pwd) || _h_canon=$_h
+        if [ "$_h_canon" = "/" ]; then _root_canon="/$_t"
+        else _root_canon="$_h_canon/$_t"; fi
+      else
+        _root_canon=$_exp
+      fi
+    fi
+    if [ -z "$_root_canon" ] || [ "$_root_canon" = "/" ]; then
+      IFS=$_OLD_IFS
+      log E launcher fail "trustedSymlinkRoots entry resolves to filesystem root: $_entry"
+      exit 1
+    fi
+    if [ -n "$_canon_home_for_trust" ]; then
+      case "$_root_canon" in
+        "$_canon_home_for_trust"|"$_canon_home_for_trust"/*) ;;
+        *)
+          IFS=$_OLD_IFS
+          log E launcher fail "trustedSymlinkRoots entry must canonicalise under \$HOME ($_canon_home_for_trust): $_entry -> $_root_canon"
+          exit 1
+          ;;
+      esac
+    fi
+    AGENT_TRUSTED_ROOTS="$AGENT_TRUSTED_ROOTS$_root_canon
+"
+  done
+  IFS=$_OLD_IFS
+  export AGENT_TRUSTED_ROOTS
+
   CRATE_ENV="$_env_name"
   if [ -n "$_env_name" ]; then
     CRATE_DIR="/usr/local/etc/crate/$AGENT"
@@ -202,8 +304,6 @@ agent_load() {
       *)        CRATE_DIR="$_default" ;;
     esac
   fi
-
-  agent_validate_manifest_paths
 }
 
 # Validate every manifest-supplied relative path (files.rw, files.ro,
@@ -235,6 +335,35 @@ agent_validate_manifest_paths() {
   ' "$AGENT_MANIFEST")
   if [ "$_bad" != "null" ]; then
     log E launcher fail "$AGENT_MANIFEST has unsafe path entry: $_bad (allowed: relative paths with [A-Za-z0-9._-] segments, no '.' / '..' / absolute / empty)"
+    exit 1
+  fi
+  # trustedSymlinkRoots: pre-check the field is null or array (jq's
+  # `map` would error on a string), then per-entry safety rules. This
+  # validator catches embedded NUL/control bytes that the shell-side
+  # parser in agent_load couldn't see safely without jq's JSON awareness.
+  # Final containment ($HOME-resident, canonicalised) happens in
+  # agent_load after this validator returns.
+  _root_type=$(jq -r '.trustedSymlinkRoots | type' "$AGENT_MANIFEST")
+  case "$_root_type" in
+    null|array) ;;
+    *)
+      log E launcher fail "$AGENT_MANIFEST .trustedSymlinkRoots must be an array (got $_root_type)"
+      exit 1
+      ;;
+  esac
+  _bad_root=$(jq -r '
+    def safeRoot:
+      type == "string"
+      and length > 0
+      and (startswith("$HOME/") or startswith("/"))
+      and (split("/") | all(. != ".."))
+      and (test("[\u0000-\u001f]") | not);
+    (.trustedSymlinkRoots // [])
+    | map(select(safeRoot | not))
+    | (.[0] // null) | tojson
+  ' "$AGENT_MANIFEST")
+  if [ "$_bad_root" != "null" ]; then
+    log E launcher fail "$AGENT_MANIFEST has unsafe trustedSymlinkRoots entry: $_bad_root (allowed: '\$HOME/...' or '/...' absolute paths, no '..' segments, no control chars)"
     exit 1
   fi
 }

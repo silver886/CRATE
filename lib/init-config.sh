@@ -48,19 +48,36 @@ _realpath() {
 }
 
 # Assert a symlink-resolved path stays under a trusted root: the
-# canonical agent config dir OR the user's $HOME. /etc/passwd and
-# system locations still fail; a symlink in scoop's persist dir to
-# ~/.config/<agent>/.credentials.json (or any cross-tool layout where
-# the user has linked across their own profile) succeeds. Run after
-# every _realpath / _resolve_dir. Patterns are unquoted so the
-# trailing `/*` keeps its glob semantics; both roots are canonical
-# (cd -P) so they contain no glob metacharacters.
+# canonical agent config dir, or any path declared in the manifest's
+# `trustedSymlinkRoots` array (canonicalised in agent_load). /etc/...,
+# ~/.ssh, browser tokens, etc. all fail by default — the previous
+# blanket "all of $HOME" widening let an LLM agent with write access
+# to its own config dir plant a symlink to any home-resident secret
+# and have it staged into the next session. See code-review-handoff.md
+# CR-001. To re-enable a known cross-app layout (e.g. scoop persist
+# on Windows), declare it explicitly in the agent manifest.
+#
+# AGENT_TRUSTED_ROOTS is newline-delimited (entries validated to
+# contain no LF/CR in agent_load). Iterate via IFS=newline so paths
+# with spaces survive intact — `for x in $var` would split on the
+# default IFS otherwise.
 _assert_under_config() {
   case "$1" in
     "$_real_config_dir"|"$_real_config_dir"/*) return 0 ;;
-    "$_real_home"|"$_real_home"/*) return 0 ;;
   esac
-  log E config fail "manifest entry resolves outside trusted dirs: $2 -> $1 (must stay under $_real_config_dir or \$HOME=$_real_home)"
+  if [ -n "$AGENT_TRUSTED_ROOTS" ]; then
+    _OLD_IFS=$IFS
+    IFS='
+'
+    for _root in $AGENT_TRUSTED_ROOTS; do
+      [ -z "$_root" ] && continue
+      case "$1" in
+        "$_root"|"$_root"/*) IFS=$_OLD_IFS; return 0 ;;
+      esac
+    done
+    IFS=$_OLD_IFS
+  fi
+  log E config fail "manifest entry resolves outside trusted dirs: $2 -> $1 (must stay under $_real_config_dir or a manifest-declared trustedSymlinkRoots entry)"
   exit 1
 }
 
@@ -127,19 +144,6 @@ init_config_dir() {
     log E config fail "$AGENT config directory cannot be canonicalized: $AGENT_CONFIG_DIR"
     exit 1
   }
-  # $HOME's canonical form widens the trust zone for _assert_under_config.
-  # User-resident files (~/.config/<agent>/..., scoop persist dirs that
-  # symlink across the profile, etc.) are part of the user's own trust
-  # boundary; a symlink in the config dir to /etc/* or /var/* is still
-  # rejected. Fall back to literal $HOME on cd -P failure (e.g. an
-  # unmounted home — extremely unusual). If $HOME is unset or '/' the
-  # case-pattern below would match every absolute path, defeating the
-  # gate; collapse to the config dir in that case so the home branch
-  # adds nothing to the existing allowlist.
-  _real_home=$(cd -P -- "$HOME" 2>/dev/null && pwd) || _real_home=$HOME
-  case "$_real_home" in
-    ''|/) _real_home=$_real_config_dir ;;
-  esac
 
   SYSTEM_DIR="$PWD/$AGENT_PROJECT_DIR/.system"
 
@@ -148,6 +152,14 @@ init_config_dir() {
   # session history live there and should not be committed. Match the
   # agent's own project dir ('/.claude/.system', '/.gemini/.system', …)
   # or any parent that already excludes it (e.g. '.claude', '.claude/').
+  #
+  # Walk upward from $PWD to find the repo top-level: the launcher may
+  # run from a subdir of a larger repo (e.g. `~/myrepo/subproj/`), in
+  # which case `.system/` is still commit-visible from the parent and
+  # the warning must still fire. The previous `[ -e "$PWD/.git" ]` check
+  # missed that. Stop at filesystem root. Both regular `.git` dirs and
+  # worktree pointer files (`.git` is a regular file) are detected via
+  # `-e`. See code-review-handoff.md CR-003.
   #
   # Only `.` needs escaping: agent_load whitelists $AGENT_PROJECT_DIR to
   # [A-Za-z0-9._-]+, so the rest is regex-inert in both rg's Rust regex
@@ -164,9 +176,21 @@ init_config_dir() {
       grep -qE "^[[:space:]]*/?${_pd_re}(/(\.system)?/?)?[[:space:]]*\$" "$1" 2>/dev/null
     fi
   }
-  if [ -e "$PWD/.git" ] && { [ ! -f "$PWD/.gitignore" ] || \
-       ! _has_gitignore_entry "$PWD/.gitignore"; }; then
-    log W config gitignore "$PWD/.gitignore does not exclude $_pd/.system/; add a '$_pd/.system/' entry to keep credentials and session history out of commits"
+  _git_top=""
+  _walk=$PWD
+  while [ -n "$_walk" ]; do
+    if [ -e "$_walk/.git" ]; then
+      _git_top=$_walk
+      break
+    fi
+    [ "$_walk" = "/" ] && break
+    _next=${_walk%/*}
+    [ -z "$_next" ] && _next=/
+    _walk=$_next
+  done
+  if [ -n "$_git_top" ] && { [ ! -f "$_git_top/.gitignore" ] || \
+       ! _has_gitignore_entry "$_git_top/.gitignore"; }; then
+    log W config gitignore "$_git_top/.gitignore does not exclude $_pd/.system/; add a '$_pd/.system/' entry to keep credentials and session history out of commits"
   fi
 
   mkdir -p "$SYSTEM_DIR/.mask" "$SESSION_DIR/cr"

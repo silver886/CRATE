@@ -377,14 +377,29 @@ $resolveSessionId = {
 # drive-letter paths. Validate the user-controlled roots up front so a
 # UNC working directory fails BEFORE we import a distro or pull
 # tarballs, instead of mid-bootstrap.
+#
+# %TEMP% and %LOCALAPPDATA% are checked too: wsl.ps1 stores per-launch
+# files under $env:TEMP\crate-<id> and feeds them into $wslSrc (215/230/
+# 238), and imports the distro into $env:LocalAppData\<distro>. Either
+# being redirected to UNC/network storage (folder redirection, OneDrive
+# Known Folder Move) would otherwise fail mid-launch — after `wsl
+# --import` or after the base-tar export — leaving partial state to
+# clean up. See code-review-handoff.md CR-002.
 $preflightWslPaths = {
   if (-not $IsWindows) { return }
-  foreach ($p in @($PWD.Path, $projectRoot, $cacheDir)) {
-    if (-not $p) { continue }
-    $abs = [IO.Path]::GetFullPath($p)
+  $checks = @(
+    @{ Name = '$PWD';            Value = $PWD.Path }
+    @{ Name = '$projectRoot';    Value = $projectRoot }
+    @{ Name = '$cacheDir';       Value = $cacheDir }
+    @{ Name = '$env:TEMP';       Value = $env:TEMP }
+    @{ Name = '$env:LocalAppData'; Value = $env:LocalAppData }
+  )
+  foreach ($c in $checks) {
+    if (-not $c.Value) { continue }
+    $abs = [IO.Path]::GetFullPath($c.Value)
     if ($abs.Length -lt 3 -or $abs[1] -ne ':') {
-      Write-Log E launcher fail "host path '$abs' is not a drive-letter path; CRATE on Windows only supports drive-letter paths (UNC and \\wsl$ paths are not auto-mounted into the distro). See README 'Windows path requirements'."
-      throw "non-drive-letter host path: $abs"
+      Write-Log E launcher fail "$($c.Name)='$abs' is not a drive-letter path; CRATE on Windows only supports drive-letter paths (UNC and \\wsl$ paths are not auto-mounted into the distro, and folder-redirected TEMP/LOCALAPPDATA break mid-bootstrap). See README 'Windows path requirements'."
+      throw "non-drive-letter host path: $($c.Name)=$abs"
     }
   }
 }

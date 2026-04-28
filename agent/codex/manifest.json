@@ -11,6 +11,7 @@
     "ro":     ["AGENTS.md", "AGENTS.override.md"],
     "roDirs": ["rules"]
   },
+  "trustedSymlinkRoots": ["$HOME/.config/codex"],
   "credential": { "strategy": "oauth-openai", "file": "auth.json" },
   "executable": {
     "type":           "platform-binary",
