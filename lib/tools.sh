@@ -130,17 +130,30 @@ fetch_shared_versions() {
   (curl -fsSL -A "$CRATE_USER_AGENT" https://nodejs.org/dist/index.json \
     | jq -r '[.[] | select(.lts != false)][0].version' | sed 's/^v//' > "$_DIR/node") &
   _PID1=$!
-  (curl -fsSL -A "$CRATE_USER_AGENT" https://api.github.com/repos/BurntSushi/ripgrep/releases/latest \
-    | jq -r .tag_name > "$_DIR/rg") &
+  # ripgrep: crates.io is the canonical registry (BurntSushi publishes
+  # there in lock-step with GH releases). Hitting the API there avoids
+  # GH's 60 req/hour unauthenticated rate limit.
+  (curl -fsSL -A "$CRATE_USER_AGENT" https://crates.io/api/v1/crates/ripgrep \
+    | jq -r .crate.max_stable_version > "$_DIR/rg") &
   _PID2=$!
-  (curl -fsSL -A "$CRATE_USER_AGENT" https://api.github.com/repos/zyedidia/micro/releases/latest \
-    | jq -r .tag_name | sed 's/^v//' > "$_DIR/micro") &
+  # micro is GH-only, so we resolve the version via the web-side
+  # `releases/latest` redirect — github.com (not api.github.com) — which
+  # is not subject to the API rate limit. The Location header points to
+  # `releases/tag/v<version>`; strip the leading `v`.
+  (_final=$(curl -fsSLI -A "$CRATE_USER_AGENT" -o /dev/null -w '%{url_effective}' \
+     https://github.com/micro-editor/micro/releases/latest)
+   _tag=${_final##*/}
+   printf '%s' "${_tag#v}" > "$_DIR/micro") &
   _PID3=$!
-  # pnpm: GH release JSON gives both version and per-asset sha256
-  # digest. The npm registry only exposes the npm-tarball checksum, not
-  # the standalone pnpm-linux-<arch> binary that we actually download
-  # from GH — different artifact, different checksum.
-  (curl -fsSL -A "$CRATE_USER_AGENT" https://api.github.com/repos/pnpm/pnpm/releases/latest > "$_DIR/pnpm.json") &
+  # pnpm: version from the @pnpm/exe npm package's `latest` dist-tag —
+  # the maintainer's blessed stable channel. The
+  # /-/package/<name>/dist-tags endpoint returns only the tag map
+  # (~150 bytes) instead of the full versions document (~500KB). The
+  # subpackage that holds the binary is selected by major version
+  # below (see PNPM_NPM_PKG) so a future v11-as-`latest` promotion
+  # transitions automatically.
+  (curl -fsSL -A "$CRATE_USER_AGENT" https://registry.npmjs.org/-/package/@pnpm/exe/dist-tags \
+    | jq -r '.latest // empty' > "$_DIR/pnpm") &
   _PID4=$!
   (curl -fsSL -A "$CRATE_USER_AGENT" https://pypi.org/pypi/uv/json \
     | jq -r .info.version > "$_DIR/uv") &
@@ -149,10 +162,7 @@ fetch_shared_versions() {
   NODE_VER=$(cat "$_DIR/node")
   RG_VER=$(cat "$_DIR/rg")
   MICRO_VER=$(cat "$_DIR/micro")
-  PNPM_VER=$(jq -r '.tag_name | sub("^v"; "")' "$_DIR/pnpm.json")
-  PNPM_LINUX_SHA=$(jq -r --arg n "pnpm-linux-${ARCH}" \
-    '.assets[] | select(.name == $n) | .digest // empty | sub("^sha256:"; "")' \
-    "$_DIR/pnpm.json")
+  PNPM_VER=$(cat "$_DIR/pnpm")
   UV_VER=$(cat "$_DIR/uv")
   rm -rf "$_DIR"
   if [ -z "$NODE_VER" ] || [ -z "$RG_VER" ] || [ -z "$MICRO_VER" ] || \
@@ -160,10 +170,36 @@ fetch_shared_versions() {
     log E tools fail "failed to fetch one or more tool versions"
     exit 1
   fi
-  if [ -z "$PNPM_LINUX_SHA" ]; then
-    log E tools fail "pnpm-linux-${ARCH} digest missing from GH release assets"
+
+  # Subpackage holding the binary changes with the major version:
+  #   v10 and older: @pnpm/linux-<arch>       (glibc — only variant published)
+  #   v11+:          @pnpm/linuxstatic-<arch> (musl, fully static SEA)
+  # Both layouts ship a single self-contained `package/pnpm` binary
+  # inside the tarball, verified against npm's sha512 SRI (same trust
+  # path as the agent tier). Pinning the URL host to
+  # registry.npmjs.org matches the agent-tier policy: a compromised
+  # metadata redirect can't point us at an attacker host.
+  _pnpm_major=${PNPM_VER%%.*}
+  if [ "$_pnpm_major" -ge 11 ] 2>/dev/null; then
+    PNPM_NPM_PKG="@pnpm/linuxstatic-${ARCH}"
+  else
+    PNPM_NPM_PKG="@pnpm/linux-${ARCH}"
+  fi
+  _pnpm_meta_url="https://registry.npmjs.org/${PNPM_NPM_PKG}/${PNPM_VER}"
+  if ! _pnpm_meta=$(curl -fsSL -A "$CRATE_USER_AGENT" "$_pnpm_meta_url"); then
+    log E tools fail "pnpm $PNPM_VER: failed to fetch $_pnpm_meta_url"
     exit 1
   fi
+  PNPM_TARBALL_URL=$(printf '%s' "$_pnpm_meta" | jq -r '.dist.tarball // empty')
+  PNPM_NPM_INTEGRITY=$(printf '%s' "$_pnpm_meta" | jq -r '.dist.integrity // empty')
+  if [ -z "$PNPM_TARBALL_URL" ] || [ -z "$PNPM_NPM_INTEGRITY" ]; then
+    log E tools fail "pnpm $PNPM_VER: missing dist.tarball / dist.integrity at $_pnpm_meta_url"
+    exit 1
+  fi
+  case "$PNPM_TARBALL_URL" in
+    https://registry.npmjs.org/*) ;;
+    *) log E tools fail "pnpm tarball URL not on registry.npmjs.org: $PNPM_TARBALL_URL"; exit 1 ;;
+  esac
 }
 
 # Fetch the agent's latest npm version. Sets: AGENT_VER
@@ -291,7 +327,7 @@ _build_base_tier() {
   ) &
   _PID2=$!
   (
-    _url="https://github.com/zyedidia/micro/releases/download/v${MICRO_VER}/micro-${MICRO_VER}-${ARCH_MICRO}.tar.gz"
+    _url="https://github.com/micro-editor/micro/releases/download/v${MICRO_VER}/micro-${MICRO_VER}-${ARCH_MICRO}.tar.gz"
     _file="$_DIR/_micro.tar.gz"
     curl -fsSL -A "$CRATE_USER_AGENT" "$_url" -o "$_file"
     # micro uses '.sha' (not '.sha256') as its sidecar suffix; the
@@ -334,16 +370,27 @@ _build_tool_tier() {
     log W tools.tool rebuild "cached archive corrupt; rebuilding"
     rm -f "$TOOL_ARCHIVE"
   fi
-  log I tools.tool downloading "pnpm $PNPM_VER, uv $UV_VER"
+  log I tools.tool downloading "pnpm $PNPM_VER ($PNPM_NPM_PKG), uv $UV_VER"
   _DIR=$(mktemp -d)
 
   (
-    _url="https://github.com/pnpm/pnpm/releases/download/v${PNPM_VER}/pnpm-linux-${ARCH}"
-    _file="$_DIR/pnpm"
-    curl -fsSL -A "$CRATE_USER_AGENT" "$_url" -o "$_file"
-    # pnpm ships no per-asset sidecar checksum file; fetch_shared_versions
-    # captured the GH release API's per-asset 'digest' into PNPM_LINUX_SHA.
-    _verify_sha256 "$_file" "$PNPM_LINUX_SHA" "pnpm-linux-${ARCH}"
+    # pnpm SEA binary from npm subpackage (linux-<arch> on v10/glibc,
+    # linuxstatic-<arch> on v11+/musl). Both layouts pack a single
+    # self-contained binary as `package/pnpm` and ship a sha512 SRI in
+    # `dist.integrity` — same trust path as the agent tier.
+    _file="$_DIR/_pnpm.tgz"
+    curl -fsSL -A "$CRATE_USER_AGENT" "$PNPM_TARBALL_URL" -o "$_file"
+    _verify_npm_integrity "$_file" "$PNPM_NPM_INTEGRITY" "pnpm npm tarball"
+    _extract="$_DIR/_pnpm_extract"
+    mkdir -p "$_extract"
+    tar -xz -C "$_extract" -f "$_file"
+    rm -f "$_file"
+    if [ ! -f "$_extract/package/pnpm" ]; then
+      log E tools.tool fail "pnpm npm tarball missing 'package/pnpm' binary"
+      exit 1
+    fi
+    mv "$_extract/package/pnpm" "$_DIR/pnpm"
+    rm -rf "$_extract"
   ) &
   _PID1=$!
   (
@@ -616,8 +663,7 @@ build_tool_archives() {
   if [ -n "${OPT_TOOL_HASH:-}" ]; then
     TOOL_ARCHIVE=$(resolve_archive "tool" "$OPT_TOOL_HASH")
   else
-    # Same arch:$ARCH rationale as base-tier above — pnpm and uv are
-    # arch-specific binaries.
+    # arch:$ARCH covers pnpm and uv (both per-arch native binaries).
     TOOL_HASH=$(sha256 "tool-arch:$ARCH-pnpm:$PNPM_VER-uv:$UV_VER")
     TOOL_ARCHIVE="$TOOLS_DIR/tool-$TOOL_HASH.tar.xz"
   fi

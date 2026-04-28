@@ -75,18 +75,32 @@ $buildToolArchives = {
 
   $fetchSharedVersions = {
     $nodeTask = $http.GetStringAsync('https://nodejs.org/dist/index.json')
-    $rgTask = $http.GetStringAsync('https://api.github.com/repos/BurntSushi/ripgrep/releases/latest')
-    $microTask = $http.GetStringAsync('https://api.github.com/repos/zyedidia/micro/releases/latest')
-    # pnpm: GH release JSON gives both version and per-asset sha256 digest.
-    # The npm registry only exposes the npm-tarball checksum, not the
-    # standalone pnpm-linux-<arch> binary that we actually download.
-    $pnpmTask = $http.GetStringAsync('https://api.github.com/repos/pnpm/pnpm/releases/latest')
+    # ripgrep: crates.io is the canonical registry (BurntSushi publishes
+    # there in lock-step with GH releases). Hitting the API there avoids
+    # GH's 60 req/hour unauthenticated rate limit.
+    $rgTask = $http.GetStringAsync('https://crates.io/api/v1/crates/ripgrep')
+    # micro is GH-only, so we resolve the version via the web-side
+    # `releases/latest` redirect — github.com (not api.github.com) — which
+    # is not subject to the API rate limit. SendAsync with HEAD lets the
+    # default HttpClientHandler follow the 301→302 chain; the final
+    # RequestUri (.../releases/tag/v<version>) gives us the version.
+    $microReq = [Net.Http.HttpRequestMessage]::new(
+      [Net.Http.HttpMethod]::Head,
+      'https://github.com/micro-editor/micro/releases/latest')
+    $microTask = $http.SendAsync($microReq)
+    # pnpm: version from the @pnpm/exe npm package's `latest` dist-tag —
+    # the maintainer's blessed stable channel. The
+    # /-/package/<name>/dist-tags endpoint returns only the tag map
+    # (~150 bytes) instead of the full versions document (~500KB). The
+    # subpackage that holds the binary is selected by major version
+    # below (see $pnpmNpmPkg) so a future v11-as-`latest` promotion
+    # transitions automatically.
+    $pnpmTask = $http.GetStringAsync('https://registry.npmjs.org/-/package/@pnpm/exe/dist-tags')
     $uvTask = $http.GetStringAsync('https://pypi.org/pypi/uv/json')
     [Threading.Tasks.Task]::WaitAll($nodeTask, $rgTask, $microTask, $pnpmTask, $uvTask)
 
     $nodeJson = [Text.Json.JsonDocument]::Parse($nodeTask.Result)
     $rgJson = [Text.Json.JsonDocument]::Parse($rgTask.Result)
-    $microJson = [Text.Json.JsonDocument]::Parse($microTask.Result)
     $pnpmJson = [Text.Json.JsonDocument]::Parse($pnpmTask.Result)
     $uvJson = [Text.Json.JsonDocument]::Parse($uvTask.Result)
 
@@ -98,26 +112,18 @@ $buildToolArchives = {
         break
       }
     }
-    $script:rgVer = $rgJson.RootElement.GetProperty('tag_name').GetString()
-    $script:microVer = $microJson.RootElement.GetProperty('tag_name').GetString().TrimStart('v')
-    $script:pnpmVer = $pnpmJson.RootElement.GetProperty('tag_name').GetString().TrimStart('v')
+    $script:rgVer = $rgJson.RootElement.GetProperty('crate').GetProperty('max_stable_version').GetString()
+    # Final URI after the 301→302 chain looks like
+    # `https://github.com/micro-editor/micro/releases/tag/v2.0.15`;
+    # take the last path segment and strip the leading 'v'.
+    $microFinalUri = $microTask.Result.RequestMessage.RequestUri.ToString()
+    $microSeg = $microFinalUri.Substring($microFinalUri.LastIndexOf('/') + 1)
+    $script:microVer = $microSeg.TrimStart('v')
+    $microTask.Result.Dispose()
+    $script:pnpmVer = $pnpmJson.RootElement.GetProperty('latest').GetString()
     $script:uvVer = $uvJson.RootElement.GetProperty('info').GetProperty('version').GetString()
 
-    # Resolve pnpm-linux-<arch> sha256 from the release's per-asset
-    # 'digest' field (`sha256:<hex>`). $detectArch ran first, so $arch
-    # is set.
-    $script:pnpmLinuxSha = $null
-    $pnpmAssetName = "pnpm-linux-$($script:arch)"
-    foreach ($a in $pnpmJson.RootElement.GetProperty('assets').EnumerateArray()) {
-      if ($a.GetProperty('name').GetString() -eq $pnpmAssetName) {
-        $d = $a.GetProperty('digest').GetString()
-        if ($d.StartsWith('sha256:')) { $d = $d.Substring(7) }
-        $script:pnpmLinuxSha = $d
-        break
-      }
-    }
-
-    $nodeJson.Dispose(); $rgJson.Dispose(); $microJson.Dispose()
+    $nodeJson.Dispose(); $rgJson.Dispose()
     $pnpmJson.Dispose(); $uvJson.Dispose()
 
     # Mirror lib/tools.sh: fail fast if any upstream returned an unexpected
@@ -133,9 +139,51 @@ $buildToolArchives = {
       Write-Log E tools fail "failed to fetch one or more tool versions: $($missing -join ', ')"
       throw "failed to fetch tool versions: $($missing -join ', ')"
     }
-    if (-not $script:pnpmLinuxSha) {
-      Write-Log E tools fail "$pnpmAssetName digest missing from GH release assets"
-      throw "pnpm-linux-$($script:arch) digest missing"
+
+    # Resolve npm tarball URL + integrity for the matching
+    # linuxstatic-<arch> binary subpackage. The npm tarball ships a
+    # single self-contained SEA (dist/ baked into the snapshot, no
+    # sibling files), and we verify against npm's sha512 SRI — same
+    # trust path as the agent tier. Pinning the URL host to
+    # registry.npmjs.org matches the agent-tier policy: a compromised
+    # metadata redirect can't point us at an attacker host.
+    # Subpackage holding the binary changes with the major version:
+    #   v10 and older: @pnpm/linux-<arch>       (glibc — only variant published)
+    #   v11+:          @pnpm/linuxstatic-<arch> (musl, fully static SEA)
+    # Both layouts ship a single self-contained `package/pnpm` binary
+    # inside the tarball, verified against npm's sha512 SRI (same
+    # trust path as the agent tier). $pnpmNpmPkg is passed into the
+    # tier-builder thread job for logging.
+    $pnpmMajor = 0
+    [int]::TryParse(($script:pnpmVer -split '\.')[0], [ref]$pnpmMajor) | Out-Null
+    if ($pnpmMajor -ge 11) {
+      $script:pnpmNpmPkg = "@pnpm/linuxstatic-$($script:arch)"
+    }
+    else {
+      $script:pnpmNpmPkg = "@pnpm/linux-$($script:arch)"
+    }
+    $pnpmMetaUrl = "https://registry.npmjs.org/$($script:pnpmNpmPkg)/$($script:pnpmVer)"
+    try {
+      $pnpmMetaJson = $http.GetStringAsync($pnpmMetaUrl).Result
+    }
+    catch {
+      Write-Log E tools fail "pnpm $($script:pnpmVer): failed to fetch $pnpmMetaUrl"
+      throw "pnpm npm metadata fetch failed: $_"
+    }
+    $pnpmMetaDoc = [Text.Json.JsonDocument]::Parse($pnpmMetaJson)
+    try {
+      $dist = $pnpmMetaDoc.RootElement.GetProperty('dist')
+      $script:pnpmTarballUrl = $dist.GetProperty('tarball').GetString()
+      $script:pnpmNpmIntegrity = $dist.GetProperty('integrity').GetString()
+    }
+    finally { $pnpmMetaDoc.Dispose() }
+    if (-not $script:pnpmTarballUrl -or -not $script:pnpmNpmIntegrity) {
+      Write-Log E tools fail "pnpm $($script:pnpmVer): missing dist.tarball / dist.integrity at $pnpmMetaUrl"
+      throw "pnpm npm metadata missing dist fields"
+    }
+    if (-not $script:pnpmTarballUrl.StartsWith('https://registry.npmjs.org/')) {
+      Write-Log E tools fail "pnpm tarball URL not on registry.npmjs.org: $($script:pnpmTarballUrl)"
+      throw "pnpm tarball URL not on npm registry"
     }
   }
 
@@ -344,7 +392,7 @@ $buildToolArchives = {
           $nodeUrl = "https://nodejs.org/dist/v$($vars.nodeVer)/$nodeTarballName"
           $nodeShaUrl = "https://nodejs.org/dist/v$($vars.nodeVer)/SHASUMS256.txt"
           $rgUrl = "https://github.com/BurntSushi/ripgrep/releases/download/$($vars.rgVer)/ripgrep-$($vars.rgVer)-$($vars.archRg).tar.gz"
-          $microUrl = "https://github.com/zyedidia/micro/releases/download/v$($vars.microVer)/micro-$($vars.microVer)-$($vars.archMicro).tar.gz"
+          $microUrl = "https://github.com/micro-editor/micro/releases/download/v$($vars.microVer)/micro-$($vars.microVer)-$($vars.archMicro).tar.gz"
           # Fetch artifacts and publisher checksums in parallel. micro
           # uses '.sha' (not '.sha256') as its sidecar suffix.
           $nodeTask = $http.GetByteArrayAsync($nodeUrl)
@@ -377,22 +425,38 @@ $buildToolArchives = {
           $packInputs = @('node', 'rg', 'micro')
         }
         'tool' {
-          Write-Log I $stage downloading "pnpm $($vars.pnpmVer), uv $($vars.uvVer)"
-          $pnpmUrl = "https://github.com/pnpm/pnpm/releases/download/v$($vars.pnpmVer)/pnpm-linux-$($vars.arch)"
+          Write-Log I $stage downloading "pnpm $($vars.pnpmVer) ($($vars.pnpmNpmPkg)), uv $($vars.uvVer)"
+          # pnpm SEA binary from npm subpackage (linux-<arch> on
+          # v10/glibc, linuxstatic-<arch> on v11+/musl). Both layouts
+          # pack a single self-contained binary as `package/pnpm` and
+          # ship a sha512 SRI in `dist.integrity` — same trust path as
+          # the agent tier.
+          $pnpmUrl = $vars.pnpmTarballUrl
           $uvUrl = "https://github.com/astral-sh/uv/releases/download/$($vars.uvVer)/uv-$($vars.archTriple).tar.gz"
           $pnpmTask = $http.GetByteArrayAsync($pnpmUrl)
           $uvTask = $http.GetByteArrayAsync($uvUrl)
-          # pnpm ships no per-asset sidecar checksum file; the parent
-          # captured the GH release API's per-asset 'digest' into
-          # $vars.pnpmLinuxSha. uv ships a '<url>.sha256' sidecar.
+          # uv ships a '<url>.sha256' sidecar; pnpm's integrity travels
+          # via $vars.pnpmNpmIntegrity (sha512 SRI) instead.
           $uvShaTask = $http.GetStringAsync("$uvUrl.sha256")
           [Threading.Tasks.Task]::WaitAll($pnpmTask, $uvTask, $uvShaTask)
 
-          & $verifySha256 $pnpmTask.Result $vars.pnpmLinuxSha "pnpm-linux-$($vars.arch)"
+          & $verifyNpmIntegrity $pnpmTask.Result $vars.pnpmNpmIntegrity 'pnpm npm tarball'
           $uvExp = & $firstShaToken $uvShaTask.Result
           & $verifySha256 $uvTask.Result $uvExp 'uv'
 
-          [IO.File]::WriteAllBytes("$tmpDir\pnpm", $pnpmTask.Result)
+          $pnpmTmp = "$tmpDir\_pnpm.tgz"; [IO.File]::WriteAllBytes($pnpmTmp, $pnpmTask.Result)
+          $pnpmExtract = "$tmpDir\_pnpm_extract"
+          [IO.Directory]::CreateDirectory($pnpmExtract) > $null
+          & $mustNative tar -xzf $pnpmTmp -C $pnpmExtract
+          [IO.File]::Delete($pnpmTmp)
+          $pnpmBinSrc = "$pnpmExtract\package\pnpm"
+          if (-not [IO.File]::Exists($pnpmBinSrc)) {
+            Write-Log E $stage fail "pnpm npm tarball missing 'package/pnpm' binary"
+            throw "pnpm npm tarball missing 'package/pnpm' binary"
+          }
+          [IO.File]::Move($pnpmBinSrc, "$tmpDir\pnpm")
+          [IO.Directory]::Delete($pnpmExtract, $true)
+
           $uvTmp = "$tmpDir\_uv.tar.gz"; [IO.File]::WriteAllBytes($uvTmp, $uvTask.Result)
           & $mustNative tar -xzf $uvTmp -C $tmpDir --strip-components=1
           [IO.File]::Delete($uvTmp)
@@ -565,7 +629,7 @@ $buildToolArchives = {
       $script:toolArchive = & $resolveArchive 'tool' $optToolHash
     }
     else {
-      # Same arch:$arch rationale as base-tier above.
+      # arch:$arch covers pnpm and uv (both per-arch native binaries).
       $toolHash = & $sha256 "tool-arch:$($script:arch)-pnpm:$pnpmVer-uv:$uvVer"
       $script:toolArchive = "$toolsDir\tool-$toolHash.tar.xz"
     }
@@ -656,7 +720,9 @@ $buildToolArchives = {
       userAgent = $crateUserAgent
       pnpmVer = $script:pnpmVer; uvVer = $script:uvVer
       arch = $script:arch; archTriple = $script:archTriple
-      pnpmLinuxSha = $script:pnpmLinuxSha
+      pnpmNpmPkg = $script:pnpmNpmPkg
+      pnpmTarballUrl = $script:pnpmTarballUrl
+      pnpmNpmIntegrity = $script:pnpmNpmIntegrity
     }
     $agentVars = @{
       kind = 'agent'
