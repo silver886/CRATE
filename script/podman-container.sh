@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+# `pwd -P` resolves symlinks/junctions in path components so PROJECT_ROOT
+# is the canonical filesystem location. Podman archives the build
+# context by physical path: on Windows (junction) and on macOS/Linux
+# (symlink), the alias path can fail during `podman image build`'s
+# context-tar phase. Re-resolve PROJECT_ROOT (rather than just dirname
+# the alias) to catch a junction'd parent component too.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
 # Source init-launcher.sh first (which sources lib/log.sh) so `log` is
 # available for option-parse errors and stage markers below.

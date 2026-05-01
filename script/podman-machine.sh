@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+# `pwd -P` resolves symlinks/junctions in path components so PROJECT_ROOT
+# is the canonical filesystem location. Matches the resolution
+# podman-container.sh does for its build context — even though this
+# script only SSHes into the VM (no `podman image build` here),
+# canonical paths keep log output and any future build context
+# consistent across launchers.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
 . "$PROJECT_ROOT/lib/init-launcher.sh"
 

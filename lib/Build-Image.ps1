@@ -38,10 +38,28 @@ $buildBaseImage = {
     return
   }
   Write-Log I image build $script:imageTag
+  # Resolve junction/symlink aliases in $projectRoot before passing it
+  # as the build context. On Windows, podman archives the context by
+  # physical path; an alias path (junction or symlink) can fail
+  # mid-tar — the practical reason for this resolve. ResolveLinkTarget
+  # is .NET 6+ (PS 7+); when $projectRoot is itself a reparse point we
+  # walk it, otherwise .FullName already gives a normalized path with
+  # `.`/`..` collapsed. This does NOT walk parent components — if a
+  # caller's working tree is reached through a junction'd ancestor,
+  # invoke from the canonical path or set CRATE_BUILD_CTX explicitly.
+  $rootItem = Get-Item -LiteralPath $projectRoot
+  $buildCtx = if ($rootItem.LinkType) {
+    $rootItem.ResolveLinkTarget($true).FullName
+  }
+  else {
+    $rootItem.FullName
+  }
   $buildArgs = @('image', 'build', '--build-arg', "BASE_IMAGE=$Image", '--tag', $script:imageTag)
   if ($forcePull) { $buildArgs += '--no-cache' }
   if ($selinuxOpt) { $buildArgs += $selinuxOpt }
-  $buildArgs += $projectRoot
+  $buildArgs += '-f'
+  $buildArgs += (Join-Path $buildCtx 'Containerfile')
+  $buildArgs += $buildCtx
   Invoke-Must podman @buildArgs
   Write-Log I image built $script:imageTag
 }
