@@ -1,0 +1,23 @@
+{
+  "name": "antigravity",
+  "binary": "antigravity",
+  "projectDir": ".antigravity",
+  "configDir": {
+    "env": "",
+    "default": "$HOME/.gemini"
+  },
+  "files": {
+    "rw": ["antigravity-cli/antigravity-oauth-token", "antigravity-cli/settings.json", "antigravity-cli/keybindings.json", "antigravity-cli/cache/onboarding.json"]
+  },
+  "trustedSymlinkRoots": ["$HOME/.config/antigravity-cli"],
+  "credential": { "strategy": "oauth-antigravity", "file": "antigravity-cli/antigravity-oauth-token" },
+  "executable": {
+    "github":    "google-antigravity/antigravity-cli",
+    "urlSuffix": "agy_cli_linux_{arch}.tar.gz",
+    "binPath":   "antigravity"
+  },
+  "launch": {
+    "flags": ["--dangerously-skip-permissions"],
+    "env": {}
+  }
+}

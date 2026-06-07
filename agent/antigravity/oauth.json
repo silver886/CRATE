@@ -1,0 +1,6 @@
+{
+  "_comment":       "Public OAuth client credentials shipped by Google's antigravity-cli. Per RFC 8252 (OAuth for Native Apps) and Google's installed-app docs, these identify the client application, not the end user, and are intentionally embedded in the redistributable — they are NOT secrets. We mirror upstream's values verbatim so token refresh works against the same client_id antigravity's auth flow registered. The refresh_token grant does not take a scope parameter (Google returns the originally granted scopes), so scope is intentionally omitted here. If Google rotates these upstream, mirror the new values. Treat this file as configuration, not a credential.",
+  "client_id":      "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+  "client_secret":  "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",
+  "token_endpoint": "https://oauth2.googleapis.com/token"
+}

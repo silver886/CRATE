@@ -22,8 +22,8 @@ $strategy = Get-AgentField '.credential.strategy'
 # '..\..\evil') and trigger arbitrary host-side code execution when the
 # dispatcher dot-sources $strategySrc below — well before any sandboxing
 # runs.
-if ($strategy -notin @('oauth-anthropic', 'oauth-google', 'oauth-openai')) {
-  Write-Log E cred fail "unknown credential strategy: $strategy (allowed: oauth-anthropic, oauth-google, oauth-openai)"
+if ($strategy -notin @('oauth-anthropic', 'oauth-google', 'oauth-openai', 'oauth-antigravity')) {
+  Write-Log E cred fail "unknown credential strategy: $strategy (allowed: oauth-anthropic, oauth-google, oauth-openai, oauth-antigravity)"
   throw "unknown credential strategy: $strategy"
 }
 $strategySrc = [IO.Path]::Combine($projectRoot, 'lib', 'cred', "$strategy.ps1")

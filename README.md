@@ -2,7 +2,7 @@
 
 **CRATE Runs Agents in Temporary Environments.**
 
-Run an AI coding agent — [Claude Code](https://github.com/anthropics/claude-code), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [OpenAI Codex](https://github.com/openai/codex) — inside a disposable sandbox (a Podman container, a throwaway Podman VM, or a throwaway WSL distro) so the agent's "skip all permission prompts" mode can be used without giving it access to your host.
+Run an AI coding agent — [Claude Code](https://github.com/anthropics/claude-code), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenAI Codex](https://github.com/openai/codex), or [Antigravity CLI](https://github.com/google-antigravity/antigravity-cli) — inside a disposable sandbox (a Podman container, a throwaway Podman VM, or a throwaway WSL distro) so the agent's "skip all permission prompts" mode can be used without giving it access to your host.
 
 The current working directory is mounted into the sandbox at `/var/workdir` and becomes the agent's scratch space. Everything else on the host is invisible.
 
@@ -16,9 +16,10 @@ Selected with `--agent NAME` (default: `claude`). Each agent is defined declarat
 
 | Agent | `--agent` value | Project dir | Host config dir |
 |-------|-----------------|-------------|-----------------|
-| Claude Code  | `claude` (default) | `.claude`  | `$CLAUDE_CONFIG_DIR` or `~/.claude`  |
-| Gemini CLI   | `gemini`           | `.gemini`  | `~/.gemini`                          |
-| OpenAI Codex | `codex`            | `.codex`   | `$CODEX_HOME` or `~/.codex`          |
+| Claude Code     | `claude` (default) | `.claude`      | `$CLAUDE_CONFIG_DIR` or `~/.claude`           |
+| Gemini CLI      | `gemini`           | `.gemini`      | `~/.gemini`                                   |
+| OpenAI Codex    | `codex`            | `.codex`       | `$CODEX_HOME` or `~/.codex`                   |
+| Antigravity CLI | `antigravity`      | `.antigravity` | `~/.gemini` (token under `antigravity-cli/`)  |
 
 ## What you get inside the sandbox
 
@@ -29,7 +30,7 @@ A user `agent` with `$HOME/.local/bin` on `PATH` containing:
 - `micro` (editor, set as `$EDITOR`)
 - `pnpm`
 - `uv`, `uvx`
-- The chosen agent under its native command name (`claude` / `gemini` / `codex`), implemented as a wrapper that execs the real binary with the agent's permission-skip flags and env vars baked in.
+- The chosen agent under its native command name (`claude` / `gemini` / `codex` / `antigravity`), implemented as a wrapper that execs the real binary with the agent's permission-skip flags and env vars baked in.
 
 Optional: pass `--allow-dnf` (POSIX) or `-AllowDnf` (PowerShell) to enable `sudo dnf` inside the sandbox for installing extra packages during a session. This flag must be provided at sandbox startup; if omitted, the bootstrap permission is revoked before the agent starts to prevent autonomous privilege escalation. Requires a Fedora-based image (the default), which on the podman-machine backend means Fedora CoreOS 43+ (earlier FCOS releases lacked `/usr/bin/dnf`).
 
@@ -95,7 +96,7 @@ All scripts accept:
 
 Archive filenames: `base-<hash>.tar.xz`, `tool-<hash>.tar.xz`, `<agent>-<hash>.tar.xz`. Cache is reusable across sessions; `--force-pull` rebuilds and `--{base,tool,agent}-hash` pins to an existing cached hash prefix so you can freeze a known-good toolchain without network access.
 
-Tier 3 uses the same npm `optionalDependencies` platform-sub-package pattern that esbuild pioneered, so **all three agents share one fetch path**. Claude and Codex publish platform-specific tarballs containing an ELF binary; Gemini publishes a JS bundle consumed via `node`. The manifest's `executable.type` (`platform-binary` / `node-bundle`) selects the post-extract path; `tarballUrl` is a template with `{arch}`, `{triple}`, and `{version}` placeholders.
+Tier 3 fetches the agent from one of two sources, chosen by which key the manifest's `executable` sets — exactly one of `npm` (the package name) or `github` (an `owner/name` repo). That value is both the version handle and the URL prefix; the download URL is `<launcher-owned host+infix> + <value> + urlSuffix`, so the manifest never supplies a host (it can't be redirected off-registry/off-github). The npm path uses the `optionalDependencies` platform-sub-package pattern esbuild pioneered — Claude and Codex publish platform-specific tarballs with an ELF binary, Gemini a JS bundle run via `node`, all verified against the npm `dist.integrity` SRI. The github path resolves the `releases/latest` tag, downloads the per-platform asset (`urlSuffix`, e.g. `agy_cli_linux_{arch}.tar.gz`), and verifies it against the releases-API per-asset `sha256` digest (GitHub ships no checksum sidecar) — this is how Antigravity is fetched. The post-extract layout is inferred from `binPath`: present ⇒ a single platform binary at that path, absent ⇒ a node bundle whose entries come from `package.json`. `urlSuffix`/`binPath` expand `{arch}`, `{triple}`, and `{version}`.
 
 ### Declarative agent manifests
 
@@ -104,9 +105,9 @@ Each agent's shape is described in `agent/<name>/manifest.json`:
 - `projectDir` — per-agent staging dir (`.claude`, `.gemini`, `.codex`). The sandbox's system-scope config lives in `$PWD/<projectDir>/.system/`.
 - `configDir` — where the agent reads its config on the host (respecting env-var overrides like `CLAUDE_CONFIG_DIR` / `CODEX_HOME`).
 - `files.rw` / `files.ro` / `files.roDirs` — which host files hardlink into the sandbox vs. copy read-only.
-- `credential.strategy` — selects an OAuth refresh handler (`oauth-anthropic`, `oauth-google`, or `oauth-openai`), wired through `lib/cred/<strategy>.sh` and its PowerShell mirror.
+- `credential.strategy` — selects an OAuth refresh handler (`oauth-anthropic`, `oauth-google`, `oauth-openai`, or `oauth-antigravity`), wired through `lib/cred/<strategy>.sh` and its PowerShell mirror.
 - `credential.file` — the auth file under `configDir` that the strategy reads/refreshes (e.g. `.credentials.json`, `oauth_creds.json`, `auth.json`). Must also be listed in `files.rw` so the sandbox sees the refreshed tokens via the hardlink. Named explicitly so a `files.rw` reorder can't silently change which file gets refreshed.
-- `executable` — npm package name, tarball URL template, bin/entry path inside the tarball.
+- `executable` — exactly one of `npm` (package) or `github` (`owner/name`), a templated `urlSuffix` appended to the launcher-owned base URL, and `binPath` for a single-binary agent (omitted for a node bundle). npm verifies via `dist.integrity`; github via the releases-API asset `sha256` digest.
 - `launch.flags` / `launch.env` — baked into the tier-3 archive as `agent-manifest.sh`, sourced by the wrapper at startup.
 
 Adding a fourth agent is a matter of dropping a new `agent/<name>/` directory with a manifest and a matching `lib/cred/<strategy>.sh` if the OAuth flow is new.
@@ -126,6 +127,7 @@ This keeps the image itself small, stable, and agent-agnostic — toolchain and 
 | Claude | `~/.claude/.credentials.json` | `platform.claude.com/v1/oauth/token` | `oauth-anthropic` |
 | Gemini | `~/.gemini/oauth_creds.json`  | `oauth2.googleapis.com/token`        | `oauth-google`    |
 | Codex  | `~/.codex/auth.json`          | `auth.openai.com/oauth/token`        | `oauth-openai`    |
+| Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` | `oauth2.googleapis.com/token` | `oauth-antigravity` |
 
 All three strategies use the same shape: a live GET probe (Anthropic's `claude_cli/roles`, Google's `oauth2/v3/userinfo`, OpenAI's `auth.openai.com/oauth/userinfo`) — 200 = valid, 401 = refresh. This tolerates host-clock skew and avoids timestamp math. Codex's `tokens.id_token` is stored on disk as the raw JWT string (Codex parses the struct fields out of it at load time per `codex-rs/login/src/token_data.rs`), so we write the new JWT verbatim — no re-decoding.
 
@@ -156,6 +158,7 @@ Gemini's refresh flow needs a `client_id` + `client_secret` pair to call Google'
 | Claude | `/usr/local/etc/crate/claude` | wrapper exports `CLAUDE_CONFIG_DIR` |
 | Codex  | `/usr/local/etc/crate/codex`  | wrapper exports `CODEX_HOME` |
 | Gemini | `/home/agent/.gemini`         | hard-coded default (no env var supported) |
+| Antigravity | `/home/agent/.gemini`    | hard-coded default (no env var supported); token under `antigravity-cli/` |
 
 The env-var route keeps `/home/agent` clean of agent-specific state and makes the sandbox path identical across the container (agent user) and podman-machine (core user) backends. Gemini doesn't expose a config-dir env var, so its staging is bind-mounted directly at the hard-coded `~/.gemini` path (rewritten to `/home/core/.gemini` on the VM backend).
 
@@ -212,7 +215,7 @@ The agent itself is launched as the unprivileged user `agent` — sudo is used s
 
 The single `$PWD → /var/workdir` mount on the VM/WSL backends is what avoids the macOS vfkit virtio-fs bug where a `mount --bind` whose target sits under a `mount -o remount,ro,bind` virtio-fs parent makes `open()` return EACCES for non-root processes (containers/podman#24725, FB16008360). All binds in this layout have source and target on the same device.
 
-> **Tip:** add `<projectDir>/.system/` to your project `.gitignore` (e.g. `.claude/.system/` when running Claude, `.gemini/.system/` for Gemini, `.codex/.system/` for Codex). That bucket contains your hardlinked credentials and per-project session history — none of it belongs in commits. The launcher warns if the relevant pattern is missing.
+> **Tip:** add `<projectDir>/.system/` to your project `.gitignore` (e.g. `.claude/.system/` when running Claude, `.gemini/.system/` for Gemini, `.codex/.system/` for Codex, `.antigravity/.system/` for Antigravity). That bucket contains your hardlinked credentials and per-project session history — none of it belongs in commits. The launcher warns if the relevant pattern is missing.
 
 Concurrent runs in the same project do not collide: different agents have independent `.system/` directories, and same-agent parallel launches each get their own `sessions/<id>/cr/` (see the Sessions table above).
 

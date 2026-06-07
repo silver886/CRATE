@@ -14,9 +14,8 @@
   "trustedSymlinkRoots": ["$HOME/.config/gemini-cli"],
   "credential": { "strategy": "oauth-google", "file": "oauth_creds.json" },
   "executable": {
-    "type":           "node-bundle",
-    "versionPackage": "@google/gemini-cli",
-    "tarballUrl":     "https://registry.npmjs.org/@google/gemini-cli/-/gemini-cli-{version}.tgz"
+    "npm":       "@google/gemini-cli",
+    "urlSuffix": "/-/gemini-cli-{version}.tgz"
   },
   "launch": {
     "flags": ["--skip-trust", "--yolo"],

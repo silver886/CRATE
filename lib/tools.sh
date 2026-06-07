@@ -219,9 +219,9 @@ _subst() {
     -e "s|{version}|$2|g"
 }
 
-# Fetch shared tool versions in parallel.
-# Sets: NODE_VER, RG_VER, MICRO_VER, PNPM_VER, UV_VER
-fetch_shared_versions() {
+# Fetch base-tier versions (node, ripgrep, micro) in parallel.
+# Sets: NODE_VER, RG_VER, MICRO_VER. Called inside the base pipeline.
+fetch_base_versions() {
   _DIR=$(mktemp -d)
   (curl -fsSL -A "$CRATE_USER_AGENT" https://nodejs.org/dist/index.json \
     | jq -r '[.[] | select(.lts != false)][0].version' | sed 's/^v//' > "$_DIR/node") &
@@ -241,6 +241,30 @@ fetch_shared_versions() {
    _tag=${_final##*/}
    printf '%s' "${_tag#v}" > "$_DIR/micro") &
   _PID3=$!
+  wait_all "$_PID1" "$_PID2" "$_PID3"
+  NODE_VER=$(cat "$_DIR/node")
+  RG_VER=$(cat "$_DIR/rg")
+  MICRO_VER=$(cat "$_DIR/micro")
+  rm -rf "$_DIR"
+  # micro guard: a failed or un-redirected `releases/latest` leaves the
+  # literal tail "latest" (or "releases" for a repo with no releases) as
+  # the "version". Reject all three so a hiccup fails loudly here instead
+  # of 404-ing on a bogus `micro-latest-…` download URL later. Mirrors
+  # the agent github version guard in fetch_agent_version.
+  case "$MICRO_VER" in
+    ''|releases|latest) log E tools.base fail "failed to resolve a micro release tag (got '${MICRO_VER:-}')"; exit 1 ;;
+  esac
+  if [ -z "$NODE_VER" ] || [ -z "$RG_VER" ]; then
+    log E tools.base fail "failed to fetch node/ripgrep version"
+    exit 1
+  fi
+}
+
+# Fetch tool-tier versions + pnpm metadata (pnpm, uv) in parallel.
+# Sets: PNPM_VER, UV_VER, PNPM_TARBALL_URL, PNPM_NPM_INTEGRITY. Called
+# inside the tool pipeline.
+fetch_tool_versions() {
+  _DIR=$(mktemp -d)
   # pnpm: full `latest` metadata in one fetch — gets version, tarball
   # URL, and sha512 SRI in a single ~3 KB response. We use the vanilla
   # `pnpm` package (mjs node-bundle, ~17 MB unpacked) executed against
@@ -249,27 +273,23 @@ fetch_shared_versions() {
   # which is bundled node — wasted bytes for us).
   (curl -fsSL -A "$CRATE_USER_AGENT" https://registry.npmjs.org/pnpm/latest \
     > "$_DIR/pnpm.json") &
-  _PID4=$!
+  _PID1=$!
   (curl -fsSL -A "$CRATE_USER_AGENT" https://pypi.org/pypi/uv/json \
     | jq -r .info.version > "$_DIR/uv") &
-  _PID5=$!
-  wait_all "$_PID1" "$_PID2" "$_PID3" "$_PID4" "$_PID5"
-  NODE_VER=$(cat "$_DIR/node")
-  RG_VER=$(cat "$_DIR/rg")
-  MICRO_VER=$(cat "$_DIR/micro")
+  _PID2=$!
+  wait_all "$_PID1" "$_PID2"
   _pnpm_meta=$(cat "$_DIR/pnpm.json")
   UV_VER=$(cat "$_DIR/uv")
   rm -rf "$_DIR"
   PNPM_VER=$(printf '%s' "$_pnpm_meta" | jq -r '.version // empty')
   PNPM_TARBALL_URL=$(printf '%s' "$_pnpm_meta" | jq -r '.dist.tarball // empty')
   PNPM_NPM_INTEGRITY=$(printf '%s' "$_pnpm_meta" | jq -r '.dist.integrity // empty')
-  if [ -z "$NODE_VER" ] || [ -z "$RG_VER" ] || [ -z "$MICRO_VER" ] || \
-     [ -z "$PNPM_VER" ] || [ -z "$UV_VER" ]; then
-    log E tools fail "failed to fetch one or more tool versions"
+  if [ -z "$PNPM_VER" ] || [ -z "$UV_VER" ]; then
+    log E tools.tool fail "failed to fetch pnpm/uv version"
     exit 1
   fi
   if [ -z "$PNPM_TARBALL_URL" ] || [ -z "$PNPM_NPM_INTEGRITY" ]; then
-    log E tools fail "pnpm $PNPM_VER: missing dist.tarball / dist.integrity"
+    log E tools.tool fail "pnpm $PNPM_VER: missing dist.tarball / dist.integrity"
     exit 1
   fi
   # Pinning the URL host to registry.npmjs.org matches the agent-tier
@@ -277,18 +297,79 @@ fetch_shared_versions() {
   # attacker host.
   case "$PNPM_TARBALL_URL" in
     https://registry.npmjs.org/*) ;;
-    *) log E tools fail "pnpm tarball URL not on registry.npmjs.org: $PNPM_TARBALL_URL"; exit 1 ;;
+    *) log E tools.tool fail "pnpm tarball URL not on registry.npmjs.org: $PNPM_TARBALL_URL"; exit 1 ;;
   esac
 }
 
-# Fetch the agent's latest npm version. Sets: AGENT_VER
-fetch_agent_version() {
-  _pkg=$(agent_get .executable.versionPackage)
-  AGENT_VER=$(curl -fsSL -A "$CRATE_USER_AGENT" "https://registry.npmjs.org/$_pkg/latest" | jq -r .version)
-  if [ -z "$AGENT_VER" ]; then
-    log E tools fail "failed to fetch version for $_pkg"
+# Determine the executable source from which of `.executable.npm` /
+# `.executable.github` is set (exactly one required), validate that value
+# (it flows into a download URL), and publish _EXEC_SOURCE (npm|github) and
+# _EXEC_VALUE (the npm package, or the github 'owner/name'). The value
+# doubles as the version handle and the URL id-prefix. Call this DIRECTLY,
+# never inside $(), so a validation `exit` propagates to the script.
+_resolve_exec_source() {
+  _es_npm=$(agent_get .executable.npm)
+  _es_github=$(agent_get .executable.github)
+  if [ -n "$_es_npm" ] && [ -n "$_es_github" ]; then
+    log E tools.agent fail "executable sets both .npm and .github; set exactly one"
+    exit 1
+  elif [ -n "$_es_npm" ]; then
+    # npm package name (scoped allowed): @, alphanumerics, . _ - and /.
+    case "$_es_npm" in
+      *[!A-Za-z0-9._@/-]*|*..*|/*|*/)
+        log E tools.agent fail "invalid executable.npm package: '$_es_npm' (chars [A-Za-z0-9._@/-], no '..')"
+        exit 1 ;;
+    esac
+    _EXEC_SOURCE=npm; _EXEC_VALUE=$_es_npm
+  elif [ -n "$_es_github" ]; then
+    # GitHub 'owner/name': exactly two safe segments.
+    case "$_es_github" in
+      */*/*|*[!A-Za-z0-9._/-]*|*..*|/*|*/)
+        log E tools.agent fail "invalid executable.github repo: '$_es_github' (must be 'owner/name', chars [A-Za-z0-9._-])"
+        exit 1 ;;
+      */*) ;;
+      *)
+        log E tools.agent fail "invalid executable.github repo: '$_es_github' (must be 'owner/name')"
+        exit 1 ;;
+    esac
+    _EXEC_SOURCE=github; _EXEC_VALUE=$_es_github
+  else
+    log E tools.agent fail "executable sets neither .npm nor .github; set exactly one"
     exit 1
   fi
+}
+
+# Fetch the agent's latest version. Sets: AGENT_VER.
+# npm reads `<pkg>/latest` from the registry; github resolves the
+# `releases/latest` redirect (web, not api.github.com, so it dodges the
+# 60 req/hr API rate limit — same trick the base tier uses for micro) and
+# takes the tag verbatim (the download URL path uses the tag as published,
+# so no `v` strip).
+fetch_agent_version() {
+  _resolve_exec_source
+  case "$_EXEC_SOURCE" in
+    github)
+      _final=$(curl -fsSLI -A "$CRATE_USER_AGENT" -o /dev/null -w '%{url_effective}' \
+        "https://github.com/$_EXEC_VALUE/releases/latest")
+      AGENT_VER=${_final##*/}
+      # The tag is the last path segment of the redirect target
+      # (`…/releases/tag/<tag>`). If the redirect didn't happen — repo has
+      # no releases (`…/releases`, segment "releases") or a transient
+      # error left us on the original URL (segment "latest") — the segment
+      # is one of those literals, never a real tag. Reject all three so a
+      # hiccup fails loudly here instead of 404-ing on a bogus tag later.
+      case "$AGENT_VER" in
+        ''|releases|latest) log E tools fail "failed to resolve a release tag for $_EXEC_VALUE (got '${AGENT_VER:-}')"; exit 1 ;;
+      esac
+      ;;
+    npm)
+      AGENT_VER=$(curl -fsSL -A "$CRATE_USER_AGENT" "https://registry.npmjs.org/$_EXEC_VALUE/latest" | jq -r .version)
+      if [ -z "$AGENT_VER" ]; then
+        log E tools fail "failed to fetch version for $_EXEC_VALUE"
+        exit 1
+      fi
+      ;;
+  esac
 }
 
 # Resolve a hash prefix to a cached archive path.
@@ -360,22 +441,35 @@ _pack_xz() {
 
 # ── Per-tier builders ──
 
+# Each `_build_*_tier` is a self-contained pipeline: resolve its own
+# versions + archive path, cache-check, build, pack — and print ONLY its
+# resolved archive path on stdout (all progress goes to stderr via log()).
+# build_tool_archives runs the three concurrently and captures the paths.
+# An unrecoverable error `exit 1`s the tier subshell, caught by wait_all.
 _build_base_tier() {
   if [ -n "${OPT_BASE_HASH:-}" ]; then
-    if ! _archive_ok "$BASE_ARCHIVE"; then
-      log E tools.base fail "pinned archive is corrupt: $(basename "$BASE_ARCHIVE")"
-      return 1
+    _arch=$(resolve_archive "base" "$OPT_BASE_HASH")
+    if ! _archive_ok "$_arch"; then
+      log E tools.base fail "pinned archive is corrupt: $(basename "$_arch")"
+      exit 1
     fi
-    log I tools.base cache-pin "$(basename "$BASE_ARCHIVE")"
-    return 0
+    log I tools.base cache-pin "$(basename "$_arch")"
+    printf '%s' "$_arch"; return 0
   fi
-  if [ -z "${FORCE_PULL:-}" ] && _archive_ok "$BASE_ARCHIVE"; then
-    log I tools.base cache-hit "$(basename "$BASE_ARCHIVE")"
-    return 0
+  log I tools.base resolving "latest version"
+  fetch_base_versions
+  # arch:$ARCH in the seed because the packed binaries (node, rg, micro)
+  # are architecture-specific — an x64 and an arm64 host sharing $TOOLS_DIR
+  # would otherwise collide on the same `base-*.tar.xz` filename and inject
+  # the wrong binaries.
+  _arch="$TOOLS_DIR/base-$(sha256 "base-arch:$ARCH-node:$NODE_VER-rg:$RG_VER-micro:$MICRO_VER").tar.xz"
+  if [ -z "${FORCE_PULL:-}" ] && _archive_ok "$_arch"; then
+    log I tools.base cache-hit "$(basename "$_arch")"
+    printf '%s' "$_arch"; return 0
   fi
-  if [ -f "$BASE_ARCHIVE" ] && [ -z "${FORCE_PULL:-}" ]; then
+  if [ -f "$_arch" ] && [ -z "${FORCE_PULL:-}" ]; then
     log W tools.base rebuild "cached archive corrupt; rebuilding"
-    rm -f "$BASE_ARCHIVE"
+    rm -f "$_arch"
   fi
   log I tools.base downloading "node $NODE_VER, ripgrep $RG_VER, micro $MICRO_VER"
   _DIR=$(mktemp -d)
@@ -420,34 +514,42 @@ _build_base_tier() {
   wait_all "$_PID1" "$_PID2" "$_PID3"
 
   chmod +x "$_DIR/node" "$_DIR/rg" "$_DIR/micro"
-  log I tools.base packing "$(basename "$BASE_ARCHIVE")"
+  log I tools.base packing "$(basename "$_arch")"
   # mktemp (not "$$") so a stale predictable-named partial from a prior
   # run can't be picked up as ours. The .partial.* glob in
   # build_tool_archives still matches because mktemp appends to the
   # template suffix.
-  _BASE_TMP=$(mktemp "$BASE_ARCHIVE.partial.XXXXXXXX")
+  _BASE_TMP=$(mktemp "$_arch.partial.XXXXXXXX")
   _pack_xz "$_BASE_TMP" "$_DIR" node rg micro
-  mv -f "$_BASE_TMP" "$BASE_ARCHIVE"
+  mv -f "$_BASE_TMP" "$_arch"
   rm -rf "$_DIR"
-  log I tools.base cached "$(basename "$BASE_ARCHIVE")"
+  log I tools.base cached "$(basename "$_arch")"
+  printf '%s' "$_arch"
 }
 
 _build_tool_tier() {
   if [ -n "${OPT_TOOL_HASH:-}" ]; then
-    if ! _archive_ok "$TOOL_ARCHIVE"; then
-      log E tools.tool fail "pinned archive is corrupt: $(basename "$TOOL_ARCHIVE")"
-      return 1
+    _arch=$(resolve_archive "tool" "$OPT_TOOL_HASH")
+    if ! _archive_ok "$_arch"; then
+      log E tools.tool fail "pinned archive is corrupt: $(basename "$_arch")"
+      exit 1
     fi
-    log I tools.tool cache-pin "$(basename "$TOOL_ARCHIVE")"
-    return 0
+    log I tools.tool cache-pin "$(basename "$_arch")"
+    printf '%s' "$_arch"; return 0
   fi
-  if [ -z "${FORCE_PULL:-}" ] && _archive_ok "$TOOL_ARCHIVE"; then
-    log I tools.tool cache-hit "$(basename "$TOOL_ARCHIVE")"
-    return 0
+  log I tools.tool resolving "latest version"
+  fetch_tool_versions
+  # arch:$ARCH covers uv (per-arch native binary). pnpm is JS (arch-
+  # agnostic) but shares this archive with uv, so $ARCH stays in the seed.
+  # Include the shim template since pnpm's `pnpm` entry is a rendered shim.
+  _arch="$TOOLS_DIR/tool-$(sha256 "tool-arch:$ARCH-pnpm:$PNPM_VER-uv:$UV_VER-shim:$_shim_tmpl").tar.xz"
+  if [ -z "${FORCE_PULL:-}" ] && _archive_ok "$_arch"; then
+    log I tools.tool cache-hit "$(basename "$_arch")"
+    printf '%s' "$_arch"; return 0
   fi
-  if [ -f "$TOOL_ARCHIVE" ] && [ -z "${FORCE_PULL:-}" ]; then
+  if [ -f "$_arch" ] && [ -z "${FORCE_PULL:-}" ]; then
     log W tools.tool rebuild "cached archive corrupt; rebuilding"
-    rm -f "$TOOL_ARCHIVE"
+    rm -f "$_arch"
   fi
   log I tools.tool downloading "pnpm $PNPM_VER, uv $UV_VER"
   _DIR=$(mktemp -d)
@@ -501,14 +603,15 @@ _build_tool_tier() {
   # invoked directly; the mjs entries inside pnpm-pkg/ are read by
   # node and don't need the exec bit. uv/uvx are native binaries.
   chmod +x "$_DIR/uv" "$_DIR/uvx"
-  log I tools.tool packing "$(basename "$TOOL_ARCHIVE")"
-  _TOOL_TMP=$(mktemp "$TOOL_ARCHIVE.partial.XXXXXXXX")
+  log I tools.tool packing "$(basename "$_arch")"
+  _TOOL_TMP=$(mktemp "$_arch.partial.XXXXXXXX")
   # shellcheck disable=SC2086 -- $_pnpm_shims intentionally word-split;
   # _render_node_bin_shims validates names against [A-Za-z0-9._-].
   _pack_xz "$_TOOL_TMP" "$_DIR" $_pnpm_shims pnpm-pkg uv uvx
-  mv -f "$_TOOL_TMP" "$TOOL_ARCHIVE"
+  mv -f "$_TOOL_TMP" "$_arch"
   rm -rf "$_DIR"
-  log I tools.tool cached "$(basename "$TOOL_ARCHIVE")"
+  log I tools.tool cached "$(basename "$_arch")"
+  printf '%s' "$_arch"
 }
 
 # POSIX shell-quote a value: wrap in single quotes with each embedded
@@ -576,42 +679,94 @@ _agent_manifest_sh_contents() {
 
 _build_agent_tier() {
   if [ -n "${OPT_AGENT_HASH:-}" ]; then
-    if ! _archive_ok "$AGENT_ARCHIVE"; then
-      log E "tools.$AGENT" fail "pinned archive is corrupt: $(basename "$AGENT_ARCHIVE")"
-      return 1
+    _arch=$(resolve_archive "$AGENT" "$OPT_AGENT_HASH")
+    if ! _archive_ok "$_arch"; then
+      log E tools.agent fail "pinned archive is corrupt: $(basename "$_arch")"
+      exit 1
     fi
-    log I "tools.$AGENT" cache-pin "$(basename "$AGENT_ARCHIVE")"
-    return 0
+    log I tools.agent cache-pin "$(basename "$_arch")"
+    printf '%s' "$_arch"; return 0
   fi
-  if [ -z "${FORCE_PULL:-}" ] && _archive_ok "$AGENT_ARCHIVE"; then
-    log I "tools.$AGENT" cache-hit "$(basename "$AGENT_ARCHIVE")"
-    return 0
+  log I tools.agent resolving "latest version"
+  fetch_agent_version
+  # Hash seed includes manifest source, the generated agent-manifest.sh,
+  # and the wrapper source (all CR-stripped for CRLF/LF parity), so any
+  # change to the agent's identity/flags/wrapper busts the tier-3 cache.
+  _manifest_src=$(tr -d '\r' < "$AGENT_MANIFEST")
+  _manifest_sh=$(_agent_manifest_sh_contents)
+  _wrapper_src=$(tr -d '\r' < "$PROJECT_ROOT/bin/agent-wrapper.sh")
+  _arch="$TOOLS_DIR/$AGENT-$(sha256 "agent:$AGENT-ver:$AGENT_VER-arch:$ARCH-manifest:$_manifest_src-manifest-sh:$_manifest_sh-wrapper:$_wrapper_src-shim:$_shim_tmpl").tar.xz"
+  if [ -z "${FORCE_PULL:-}" ] && _archive_ok "$_arch"; then
+    log I tools.agent cache-hit "$(basename "$_arch")"
+    printf '%s' "$_arch"; return 0
   fi
-  if [ -f "$AGENT_ARCHIVE" ] && [ -z "${FORCE_PULL:-}" ]; then
-    log W "tools.$AGENT" rebuild "cached archive corrupt; rebuilding"
-    rm -f "$AGENT_ARCHIVE"
+  if [ -f "$_arch" ] && [ -z "${FORCE_PULL:-}" ]; then
+    log W tools.agent rebuild "cached archive corrupt; rebuilding"
+    rm -f "$_arch"
   fi
 
-  _type=$(agent_get .executable.type)
-  _tarball=$(_subst "$(agent_get .executable.tarballUrl)" "$AGENT_VER")
-  log I "tools.$AGENT" downloading "$AGENT $AGENT_VER ($_type)"
+  _resolve_exec_source
+  # binPath presence is the layout discriminator: present ⇒ a single
+  # platform binary at that archive path; absent ⇒ an npm node bundle
+  # whose entries come from package.json. (binPath is intrinsic to one and
+  # meaningless to the other, so it stands in for an explicit type.)
+  _binpath=$(agent_get .executable.binPath)
+  if [ -n "$_binpath" ]; then _layout=platform-binary; else _layout=node-bundle; fi
+  log I tools.agent downloading "$AGENT $AGENT_VER ($_EXEC_SOURCE/$_layout)"
 
-  # Resolve npm package name AND tarball-version from the URL. The
-  # version we look up MUST match the tarball we download — codex
-  # publishes per-platform binaries as version-suffixed releases
-  # (`0.125.0-linux-x64`, `0.125.0-darwin-arm64`, …) under the same
-  # `@openai/codex` package, so the integrity for `0.125.0` (the JS
-  # wrapper) is NOT the integrity for `0.125.0-linux-x64` (the
-  # platform binary we actually fetch). Extract the version from the
-  # tarball's basename instead of using $AGENT_VER, which only knows
-  # the wrapper's version. URL shape: `<scope>/<name>/-/<basename>-<version>.tgz`.
-  # Restrict to registry.npmjs.org so a manifest can't redirect the
-  # verification step at an attacker-controlled metadata host.
-  case "$_tarball" in
-    https://registry.npmjs.org/*)
-      _rest=${_tarball#https://registry.npmjs.org/}
-      _pkg=${_rest%%/-/*}
-      _filename=${_rest##*/-/}
+  # Build the download URL ($_url) and a verification reference
+  # ($_verify_ref, checked per $_verify_mode after download). The host and
+  # any fixed path infix are launcher-owned constants — the manifest
+  # supplies only the validated id ($_EXEC_VALUE) and the templated
+  # urlSuffix tail. A URL path can't introduce an authority, so urlSuffix
+  # can't change the host (at worst a different path on the same trusted
+  # host) — hence no manifest-supplied host to pin.
+  _suffix_raw=$(agent_get .executable.urlSuffix)
+  case "$_suffix_raw" in
+    ''|*[!A-Za-z0-9._/{}-]*|*..*)
+      log E tools.agent fail "invalid executable.urlSuffix: '$_suffix_raw' (chars [A-Za-z0-9._/{}-], no '..')"
+      exit 1
+      ;;
+  esac
+  _suffix=$(_subst "$_suffix_raw" "$AGENT_VER")
+  case "$_EXEC_SOURCE" in
+    github)
+      # url = github.com/<repo>/releases/download/<tag>/<asset>
+      _asset=$_suffix
+      _url="https://github.com/$_EXEC_VALUE/releases/download/$AGENT_VER/$_asset"
+      # GitHub publishes no checksum sidecar, but the releases API exposes
+      # a per-asset `digest` (`sha256:<hex>`) — use it so the "verify
+      # before extract" invariant still holds. One api.github.com call per
+      # uncached build; cache hits skip it.
+      _gh_meta=$(curl -fsSL -A "$CRATE_USER_AGENT" "https://api.github.com/repos/$_EXEC_VALUE/releases/tags/$AGENT_VER")
+      _digest=$(printf '%s' "$_gh_meta" | jq -r --arg n "$_asset" '.assets[]? | select(.name == $n) | .digest // empty')
+      case "$_digest" in
+        sha256:*) _verify_ref=${_digest#sha256:} ;;
+        *)
+          log E tools.agent fail "no sha256 digest for asset '$_asset' in $_EXEC_VALUE $AGENT_VER release metadata"
+          exit 1
+          ;;
+      esac
+      _verify_mode=sha256
+      ;;
+    npm)
+      # url = registry.npmjs.org/<npm><urlSuffix>. <npm> is the version
+      # package; the DOWNLOAD package may extend it (claude's per-arch
+      # optional-dep `<npm>-linux-<arch>`), so the integrity lookup parses
+      # the CONSTRUCTED path on `/-/` for the real download pkg + tarball
+      # version — npm's canonical `<scope>/<name>/-/<name>-<version>.tgz`
+      # shape. The host is a fixed literal, never parsed from the manifest.
+      _path="$_EXEC_VALUE$_suffix"
+      _url="https://registry.npmjs.org/$_path"
+      case "$_path" in
+        */-/*) ;;
+        *)
+          log E tools.agent fail "npm <npm>+urlSuffix must form a '<pkg>/-/<file>.tgz' path: $_path"
+          exit 1
+          ;;
+      esac
+      _pkg=${_path%%/-/*}
+      _filename=${_path##*/-/}
       _pkg_base=${_pkg##*/}
       case "$_filename" in
         "${_pkg_base}-"*.tgz)
@@ -619,69 +774,63 @@ _build_agent_tier() {
           _tar_ver=${_tar_ver%.tgz}
           ;;
         *)
-          log E "tools.$AGENT" fail "tarball filename does not match '<pkg>-<version>.tgz' shape: $_filename (pkg=$_pkg_base)"
+          log E tools.agent fail "npm tarball filename does not match '<pkg>-<version>.tgz': $_filename (pkg=$_pkg_base)"
           exit 1
           ;;
       esac
-      ;;
-    *)
-      log E "tools.$AGENT" fail "unsupported tarball host (only registry.npmjs.org is allowed): $_tarball"
-      exit 1
+      _meta_url="https://registry.npmjs.org/$_pkg/$_tar_ver"
+      _verify_ref=$(curl -fsSL -A "$CRATE_USER_AGENT" "$_meta_url" | jq -r '.dist.integrity // empty')
+      if [ -z "$_verify_ref" ]; then
+        log E tools.agent fail "no dist.integrity at $_meta_url"
+        exit 1
+      fi
+      _verify_mode=npm
       ;;
   esac
-  _meta_url="https://registry.npmjs.org/$_pkg/$_tar_ver"
-  _integrity=$(curl -fsSL -A "$CRATE_USER_AGENT" "$_meta_url" | jq -r '.dist.integrity // empty')
-  if [ -z "$_integrity" ]; then
-    log E "tools.$AGENT" fail "no dist.integrity at $_meta_url"
-    exit 1
-  fi
 
   _DIR=$(mktemp -d)
   _EXTRACT="$_DIR/extract"
   _TARFILE="$_DIR/_agent.tgz"
   mkdir -p "$_EXTRACT"
-  curl -fsSL -A "$CRATE_USER_AGENT" "$_tarball" -o "$_TARFILE"
-  _verify_npm_integrity "$_TARFILE" "$_integrity" "$AGENT npm tarball"
+  curl -fsSL -A "$CRATE_USER_AGENT" "$_url" -o "$_TARFILE"
+  case "$_verify_mode" in
+    sha256) _verify_sha256        "$_TARFILE" "$_verify_ref" "$AGENT github asset" ;;
+    npm)    _verify_npm_integrity "$_TARFILE" "$_verify_ref" "$AGENT npm tarball" ;;
+  esac
   tar -xz -C "$_EXTRACT" -f "$_TARFILE"
   rm -f "$_TARFILE"
 
   _binary=$(agent_get .binary)
 
-  case "$_type" in
-    platform-binary)
-      _binPath=$(_subst "$(agent_get .executable.binPath)" "$AGENT_VER")
-      _src="$_EXTRACT/$_binPath"
-      if [ ! -f "$_src" ]; then
-        log E "tools.$AGENT" fail "binary not found in tarball: $_binPath"
-        exit 1
-      fi
-      cp "$_src" "$_DIR/${_binary}-bin"
-      chmod +x "$_DIR/${_binary}-bin"
-      ;;
-    node-bundle)
-      _pkg="${_binary}-pkg"
-      # Relocate extract/ → <binary>-pkg/ for clarity and a stable
-      # on-disk path (~/.local/lib/<binary>-pkg/) inside the sandbox.
-      if [ -d "$_EXTRACT/package" ]; then
-        mv "$_EXTRACT/package" "$_DIR/$_pkg"
-      else
-        log E "tools.$AGENT" fail "node bundle has no 'package/' dir"
-        exit 1
-      fi
-      # Render one shim per package.json `bin` entry. The canonical
-      # entry (key matching .binary) goes to ${_binary}-bin so
-      # agent-wrapper.sh finds it; auxiliary entries become standalone
-      # shims under their bin keys. Captured _agent_shims is the full
-      # space-joined list of rendered filenames (canonical + aux),
-      # word-split into pack inputs below.
-      _agent_shims=$(_render_node_bin_shims "$_DIR" "$_DIR/$_pkg" "$_pkg" \
-        "$_binary" "${_binary}-bin" "tools.$AGENT")
-      ;;
-    *)
-      log E "tools.$AGENT" fail "unknown executable.type: $_type"
+  if [ -n "$_binpath" ]; then
+    # platform-binary: copy the single binary at the (templated) archive
+    # path to <binary>-bin.
+    _binPath=$(_subst "$_binpath" "$AGENT_VER")
+    _src="$_EXTRACT/$_binPath"
+    if [ ! -f "$_src" ]; then
+      log E tools.agent fail "binary not found in tarball: $_binPath"
       exit 1
-      ;;
-  esac
+    fi
+    cp "$_src" "$_DIR/${_binary}-bin"
+    chmod +x "$_DIR/${_binary}-bin"
+  else
+    # node-bundle: relocate extract/package → <binary>-pkg/ for a stable
+    # on-disk path (~/.local/lib/<binary>-pkg/) inside the sandbox, then
+    # render one shim per package.json `bin` entry. The canonical entry
+    # (key matching .binary) goes to ${_binary}-bin so agent-wrapper.sh
+    # finds it; auxiliary entries become standalone shims under their bin
+    # keys. _agent_shims is the full space-joined list of rendered
+    # filenames (canonical + aux), word-split into pack inputs below.
+    _pkg="${_binary}-pkg"
+    if [ -d "$_EXTRACT/package" ]; then
+      mv "$_EXTRACT/package" "$_DIR/$_pkg"
+    else
+      log E tools.agent fail "node bundle has no 'package/' dir"
+      exit 1
+    fi
+    _agent_shims=$(_render_node_bin_shims "$_DIR" "$_DIR/$_pkg" "$_pkg" \
+      "$_binary" "${_binary}-bin" tools.agent)
+  fi
 
   # Ship the wrapper under the agent's command name (regular file, not
   # a symlink) — keeps behavior identical across Linux/WSL/Windows
@@ -694,18 +843,19 @@ _build_agent_tier() {
 
   rm -rf "$_EXTRACT"
 
-  log I "tools.$AGENT" packing "$(basename "$AGENT_ARCHIVE")"
-  _AGENT_TMP=$(mktemp "$AGENT_ARCHIVE.partial.XXXXXXXX")
-  if [ "$_type" = "node-bundle" ]; then
+  log I tools.agent packing "$(basename "$_arch")"
+  _AGENT_TMP=$(mktemp "$_arch.partial.XXXXXXXX")
+  if [ -n "$_binpath" ]; then
+    _pack_xz "$_AGENT_TMP" "$_DIR" "$_binary" agent-manifest.sh "${_binary}-bin"
+  else
     # shellcheck disable=SC2086 -- $_agent_shims intentionally word-split;
     # _render_node_bin_shims validates names against [A-Za-z0-9._-].
     _pack_xz "$_AGENT_TMP" "$_DIR" "$_binary" agent-manifest.sh $_agent_shims "${_binary}-pkg"
-  else
-    _pack_xz "$_AGENT_TMP" "$_DIR" "$_binary" agent-manifest.sh "${_binary}-bin"
   fi
-  mv -f "$_AGENT_TMP" "$AGENT_ARCHIVE"
+  mv -f "$_AGENT_TMP" "$_arch"
   rm -rf "$_DIR"
-  log I "tools.$AGENT" cached "$(basename "$AGENT_ARCHIVE")"
+  log I tools.agent cached "$(basename "$_arch")"
+  printf '%s' "$_arch"
 }
 
 # Build 3-tier tool archives. Respects OPT_BASE_HASH, OPT_TOOL_HASH,
@@ -724,73 +874,30 @@ build_tool_archives() {
   # -mmin and -delete.
   find "$TOOLS_DIR" -maxdepth 1 -name '*.partial.*' -mmin +60 -delete 2>/dev/null || true
 
-  # Fetch versions once up front if any tier is unpinned. Shared tier
-  # versions (node/rg/micro/pnpm/uv) and the agent version are
-  # independent — fetch whichever subset we need.
-  _need_shared=0
-  _need_agent=0
-  [ -z "${OPT_BASE_HASH:-}" ] && _need_shared=1
-  [ -z "${OPT_TOOL_HASH:-}" ] && _need_shared=1
-  [ -z "${OPT_AGENT_HASH:-}" ] && _need_agent=1
-  if [ "$_need_shared" = 1 ] && [ -z "${NODE_VER:-}" ]; then
-    fetch_shared_versions
-  fi
-  if [ "$_need_agent" = 1 ] && [ -z "${AGENT_VER:-}" ]; then
-    fetch_agent_version
-  fi
+  # Shim template bytes — both the tool tier (pnpm) and node-bundle agents
+  # render this template, so it feeds both their hashes. Read once here
+  # (CR-stripped for CRLF/LF hash parity) and inherited read-only by the
+  # tier subshells below, rather than each re-reading the file.
+  _shim_tmpl=$(tr -d '\r' < "$PROJECT_ROOT/bin/node-shim.sh.tmpl")
 
-  # Archive path resolution.
-  if [ -n "${OPT_BASE_HASH:-}" ]; then
-    BASE_ARCHIVE=$(resolve_archive "base" "$OPT_BASE_HASH")
-  else
-    # arch:$ARCH in the seed because the packed binaries (node, rg,
-    # micro) are architecture-specific. Without it, an x64 and an arm64
-    # host sharing $TOOLS_DIR (NAS-mounted cache, Apple Silicon dev
-    # switching between Rosetta and native, CI matrix with a shared
-    # build cache) collide on the same `base-*.tar.xz` filename and
-    # inject the wrong binaries — the agent then fails to exec with an
-    # opaque ELF/Mach-O error. Matches the agent-tier seed below which
-    # already includes $ARCH.
-    BASE_HASH=$(sha256 "base-arch:$ARCH-node:$NODE_VER-rg:$RG_VER-micro:$MICRO_VER")
-    BASE_ARCHIVE="$TOOLS_DIR/base-$BASE_HASH.tar.xz"
-  fi
-  # Shim template bytes — both tool tier (pnpm) and agent tier (node-
-  # bundle agents) render this template, so changes to it must bust
-  # both tier caches. Loaded once if either is unpinned and CR-stripped
-  # so Windows-side (CRLF) and Linux-side (LF) hashes match.
-  if [ -z "${OPT_TOOL_HASH:-}" ] || [ -z "${OPT_AGENT_HASH:-}" ]; then
-    _shim_tmpl=$(tr -d '\r' < "$PROJECT_ROOT/bin/node-shim.sh.tmpl")
-  fi
-  if [ -n "${OPT_TOOL_HASH:-}" ]; then
-    TOOL_ARCHIVE=$(resolve_archive "tool" "$OPT_TOOL_HASH")
-  else
-    # arch:$ARCH covers uv (per-arch native binary). pnpm is now JS,
-    # so its bytes are arch-agnostic — but the archive is shared with
-    # uv, so $ARCH stays in the seed. Include shim template since
-    # pnpm's `pnpm` entry is the rendered shim.
-    TOOL_HASH=$(sha256 "tool-arch:$ARCH-pnpm:$PNPM_VER-uv:$UV_VER-shim:$_shim_tmpl")
-    TOOL_ARCHIVE="$TOOLS_DIR/tool-$TOOL_HASH.tar.xz"
-  fi
-  if [ -n "${OPT_AGENT_HASH:-}" ]; then
-    AGENT_ARCHIVE=$(resolve_archive "$AGENT" "$OPT_AGENT_HASH")
-  else
-    # Include manifest source, generated agent-manifest.sh, and wrapper
-    # source in the hash. Generated-sh catches changes to the generator
-    # itself (e.g. adding the CLAUDE_CONFIG_DIR export). Strip CR so
-    # Windows-side (CRLF) and Linux-side (LF) hashes match for the same
-    # checkout.
-    _manifest_src=$(tr -d '\r' < "$AGENT_MANIFEST")
-    _manifest_sh=$(_agent_manifest_sh_contents)
-    _wrapper_src=$(tr -d '\r' < "$PROJECT_ROOT/bin/agent-wrapper.sh")
-    AGENT_HASH=$(sha256 "agent:$AGENT-ver:$AGENT_VER-arch:$ARCH-manifest:$_manifest_src-manifest-sh:$_manifest_sh-wrapper:$_wrapper_src-shim:$_shim_tmpl")
-    AGENT_ARCHIVE="$TOOLS_DIR/$AGENT-$AGENT_HASH.tar.xz"
-  fi
-
-  _build_base_tier &
-  _BPID=$!
-  _build_tool_tier &
-  _TPID=$!
-  _build_agent_tier &
-  _APID=$!
+  # The three tiers are fully independent end-to-end (own version probes,
+  # own hash, own cache-check, own build), so run each as a concurrent
+  # pipeline — no version-resolution barrier, and a slow/cached tier never
+  # blocks the others. Each tier prints ONLY its resolved archive path on
+  # stdout (progress logs go to stderr); we capture the three via temp
+  # files since the launcher consumes the paths after this returns. The
+  # ps1 side mirrors this with three Start-ThreadJob runspaces.
+  _PD=$(mktemp -d)
+  ( _build_base_tier  > "$_PD/base"  ) & _BPID=$!
+  ( _build_tool_tier  > "$_PD/tool"  ) & _TPID=$!
+  ( _build_agent_tier > "$_PD/agent" ) & _APID=$!
   wait_all "$_BPID" "$_TPID" "$_APID"
+  BASE_ARCHIVE=$(cat "$_PD/base")
+  TOOL_ARCHIVE=$(cat "$_PD/tool")
+  AGENT_ARCHIVE=$(cat "$_PD/agent")
+  rm -rf "$_PD"
+  if [ -z "$BASE_ARCHIVE" ] || [ -z "$TOOL_ARCHIVE" ] || [ -z "$AGENT_ARCHIVE" ]; then
+    log E tools fail "a tier pipeline did not report its archive path"
+    exit 1
+  fi
 }

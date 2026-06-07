@@ -47,9 +47,9 @@ _strategy=$(agent_get .credential.strategy)
 # the dispatcher dot-sources $_strategy_sh below — well before any
 # sandboxing runs.
 case "$_strategy" in
-  oauth-anthropic|oauth-google|oauth-openai) ;;
+  oauth-anthropic|oauth-google|oauth-openai|oauth-antigravity) ;;
   *)
-    log E cred fail "unknown credential strategy: $_strategy (allowed: oauth-anthropic, oauth-google, oauth-openai)"
+    log E cred fail "unknown credential strategy: $_strategy (allowed: oauth-anthropic, oauth-google, oauth-openai, oauth-antigravity)"
     exit 1
     ;;
 esac

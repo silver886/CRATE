@@ -14,10 +14,9 @@
   "trustedSymlinkRoots": ["$HOME/.config/claude-code"],
   "credential": { "strategy": "oauth-anthropic", "file": ".credentials.json" },
   "executable": {
-    "type":           "platform-binary",
-    "versionPackage": "@anthropic-ai/claude-code",
-    "tarballUrl":     "https://registry.npmjs.org/@anthropic-ai/claude-code-linux-{arch}/-/claude-code-linux-{arch}-{version}.tgz",
-    "binPath":        "package/claude"
+    "npm":       "@anthropic-ai/claude-code",
+    "urlSuffix": "-linux-{arch}/-/claude-code-linux-{arch}-{version}.tgz",
+    "binPath":   "package/claude"
   },
   "launch": {
     "flags": ["--dangerously-skip-permissions"],

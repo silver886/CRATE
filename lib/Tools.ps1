@@ -50,140 +50,37 @@ $detectArch = {
 $buildToolArchives = {
   $toolsDir = "$cacheDir\tools"
 
-  # HttpClient for parent-side fetches only (version probes,
-  # npm-metadata lookup). Each thread job owns its own — HttpClient
-  # never crosses the call boundary. Disposed in the outer try/finally
-  # below. UA value comes from $crateUserAgent (lib/Common.ps1) so the
-  # 'crate/1.0' literal lives in exactly one file; passed into the
-  # tier-builder thread jobs via $vars since runspaces don't inherit
-  # parent script scope.
-  $http = [Net.Http.HttpClient]::new()
-  $http.DefaultRequestHeaders.UserAgent.ParseAdd($crateUserAgent)
-
-  $sha256 = {
-    [BitConverter]::ToString(
-      [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($args[0]))
-    ).Replace('-', '').ToLower()
-  }
-
-  # Substitute {arch}, {triple}, {version} in a template string.
-  $substTokens = { param($template, $version)
-    $template.Replace('{arch}', $script:arch).
-    Replace('{triple}', $script:archTriple).
-    Replace('{version}', $version)
-  }
-
-  $fetchSharedVersions = {
-    $nodeTask = $http.GetStringAsync('https://nodejs.org/dist/index.json')
-    # ripgrep: crates.io is the canonical registry (BurntSushi publishes
-    # there in lock-step with GH releases). Hitting the API there avoids
-    # GH's 60 req/hour unauthenticated rate limit.
-    $rgTask = $http.GetStringAsync('https://crates.io/api/v1/crates/ripgrep')
-    # micro is GH-only, so we resolve the version via the web-side
-    # `releases/latest` redirect — github.com (not api.github.com) — which
-    # is not subject to the API rate limit. SendAsync with HEAD lets the
-    # default HttpClientHandler follow the 301→302 chain; the final
-    # RequestUri (.../releases/tag/v<version>) gives us the version.
-    $microReq = [Net.Http.HttpRequestMessage]::new(
-      [Net.Http.HttpMethod]::Head,
-      'https://github.com/micro-editor/micro/releases/latest')
-    $microTask = $http.SendAsync($microReq)
-    # pnpm: full `latest` metadata in one fetch — gets version, tarball
-    # URL, and sha512 SRI in a single ~3 KB response. We use the vanilla
-    # `pnpm` package (mjs node-bundle, ~17 MB unpacked) executed against
-    # the node we already ship in the base tier, NOT the per-arch
-    # @pnpm/linuxstatic-<arch> Node SEA (~140 MB unpacked, ~123 MB of
-    # which is bundled node — wasted bytes for us).
-    $pnpmTask = $http.GetStringAsync('https://registry.npmjs.org/pnpm/latest')
-    $uvTask = $http.GetStringAsync('https://pypi.org/pypi/uv/json')
-    [Threading.Tasks.Task]::WaitAll($nodeTask, $rgTask, $microTask, $pnpmTask, $uvTask)
-
-    $nodeJson = [Text.Json.JsonDocument]::Parse($nodeTask.Result)
-    $rgJson = [Text.Json.JsonDocument]::Parse($rgTask.Result)
-    $pnpmJson = [Text.Json.JsonDocument]::Parse($pnpmTask.Result)
-    $uvJson = [Text.Json.JsonDocument]::Parse($uvTask.Result)
-
-    $script:nodeVer = $null
-    foreach ($el in $nodeJson.RootElement.EnumerateArray()) {
-      $lts = $el.GetProperty('lts')
-      if ($lts.ValueKind -ne [Text.Json.JsonValueKind]::False) {
-        $script:nodeVer = $el.GetProperty('version').GetString().TrimStart('v')
-        break
+  # Determine the executable source from which of .executable.npm /
+  # .executable.github is set (exactly one), validate that value (it flows
+  # into a download URL), and publish $script:execSource (npm|github) +
+  # $script:execValue (the npm package, or the github 'owner/name'). The
+  # value doubles as the version handle and the URL id-prefix. Mirror of
+  # _resolve_exec_source in lib/tools.sh.
+  $resolveExecSource = {
+    $npmId = Get-AgentField '.executable.npm'
+    $githubId = Get-AgentField '.executable.github'
+    if ($npmId -and $githubId) {
+      Write-Log E "tools.$agent" fail "executable sets both .npm and .github; set exactly one"
+      throw "executable sets both .npm and .github"
+    }
+    elseif ($npmId) {
+      if ($npmId -notmatch '^[A-Za-z0-9._@/-]+$' -or $npmId -match '\.\.' -or $npmId.StartsWith('/') -or $npmId.EndsWith('/')) {
+        Write-Log E "tools.$agent" fail "invalid executable.npm package: '$npmId' (chars [A-Za-z0-9._@/-], no '..')"
+        throw "invalid executable.npm: $npmId"
       }
+      $script:execSource = 'npm'; $script:execValue = $npmId
     }
-    $script:rgVer = $rgJson.RootElement.GetProperty('crate').GetProperty('max_stable_version').GetString()
-    # Final URI after the 301→302 chain looks like
-    # `https://github.com/micro-editor/micro/releases/tag/v2.0.15`;
-    # take the last path segment and strip the leading 'v'.
-    $microFinalUri = $microTask.Result.RequestMessage.RequestUri.ToString()
-    $microSeg = $microFinalUri.Substring($microFinalUri.LastIndexOf('/') + 1)
-    $script:microVer = $microSeg.TrimStart('v')
-    $microTask.Result.Dispose()
-    # `pnpm/latest` returns the full version document, so version,
-    # tarball URL, and integrity all come from this single response —
-    # no second metadata fetch needed.
-    $script:pnpmVer = $pnpmJson.RootElement.GetProperty('version').GetString()
-    $pnpmDist = $pnpmJson.RootElement.GetProperty('dist')
-    $script:pnpmTarballUrl = $pnpmDist.GetProperty('tarball').GetString()
-    $script:pnpmNpmIntegrity = $pnpmDist.GetProperty('integrity').GetString()
-    $script:uvVer = $uvJson.RootElement.GetProperty('info').GetProperty('version').GetString()
-
-    $nodeJson.Dispose(); $rgJson.Dispose()
-    $pnpmJson.Dispose(); $uvJson.Dispose()
-
-    # Mirror lib/tools.sh: fail fast if any upstream returned an unexpected
-    # shape so we don't proceed to build malformed download URLs and surface
-    # the error far from its cause.
-    $missing = [Collections.Generic.List[string]]::new()
-    if (-not $script:nodeVer) { $missing.Add('node') }
-    if (-not $script:rgVer) { $missing.Add('ripgrep') }
-    if (-not $script:microVer) { $missing.Add('micro') }
-    if (-not $script:pnpmVer) { $missing.Add('pnpm') }
-    if (-not $script:uvVer) { $missing.Add('uv') }
-    if ($missing.Count -gt 0) {
-      Write-Log E tools fail "failed to fetch one or more tool versions: $($missing -join ', ')"
-      throw "failed to fetch tool versions: $($missing -join ', ')"
+    elseif ($githubId) {
+      if ($githubId -notmatch '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' -or $githubId -match '\.\.') {
+        Write-Log E "tools.$agent" fail "invalid executable.github repo: '$githubId' (must be 'owner/name', chars [A-Za-z0-9._-])"
+        throw "invalid executable.github: $githubId"
+      }
+      $script:execSource = 'github'; $script:execValue = $githubId
     }
-
-    if (-not $script:pnpmTarballUrl -or -not $script:pnpmNpmIntegrity) {
-      Write-Log E tools fail "pnpm $($script:pnpmVer): missing dist.tarball / dist.integrity"
-      throw "pnpm npm metadata missing dist fields"
+    else {
+      Write-Log E "tools.$agent" fail "executable sets neither .npm nor .github; set exactly one"
+      throw "executable sets neither .npm nor .github"
     }
-    # Pinning the URL host to registry.npmjs.org matches the agent-tier
-    # policy: a compromised metadata redirect can't point us at an
-    # attacker host.
-    if (-not $script:pnpmTarballUrl.StartsWith('https://registry.npmjs.org/')) {
-      Write-Log E tools fail "pnpm tarball URL not on registry.npmjs.org: $($script:pnpmTarballUrl)"
-      throw "pnpm tarball URL not on npm registry"
-    }
-  }
-
-  $fetchAgentVersion = {
-    $pkg = Get-AgentField '.executable.versionPackage'
-    $json = $http.GetStringAsync("https://registry.npmjs.org/$pkg/latest").Result
-    $doc = [Text.Json.JsonDocument]::Parse($json)
-    $script:agentVer = $doc.RootElement.GetProperty('version').GetString()
-    $doc.Dispose()
-    if (-not $script:agentVer) {
-      Write-Log E tools fail "failed to fetch version for $pkg"
-      throw "failed to fetch agent version"
-    }
-  }
-
-  $resolveArchive = { param($tier, $prefix)
-    $cached = $null
-    if ([IO.Directory]::Exists($toolsDir)) {
-      $cached = [IO.Directory]::GetFiles($toolsDir, "${tier}-${prefix}*.tar.xz")
-    }
-    if (-not $cached -or $cached.Length -eq 0) {
-      Write-Log E "tools.$tier" fail "no cached archive matching hash '$prefix'"
-      throw "no cached $tier archive matching hash '$prefix'"
-    }
-    if ($cached.Length -gt 1) {
-      Write-Log E "tools.$tier" fail "ambiguous hash prefix '$prefix' matches multiple archives"
-      throw "ambiguous $tier hash prefix '$prefix'"
-    }
-    $cached[0]
   }
 
   # POSIX shell-quote a value: wrap in single quotes with each embedded
@@ -241,14 +138,19 @@ $buildToolArchives = {
   # worker creates and disposes its own so the resource never crosses
   # the call boundary.
   $tierBuilder = {
-    param($logLevel, $projectRoot, $tier, $archive, $optHash, $forcePull, $vars)
+    param($logLevel, $projectRoot, $tier, $toolsDir, $pathOut, $optHash, $forcePull, $vars)
     # ThreadJob runspaces don't inherit the parent's preference variables,
     # so .NET method exceptions would default to non-terminating. Force
     # 'Stop' here so any failure escapes the job instead of being swallowed.
     $ErrorActionPreference = 'Stop'
     $script:LogLevel = $logLevel
     . "$projectRoot\lib\Log.ps1"
-    $stage = "tools.$tier"
+    # Stage from $vars.kind (base|tool|agent), not $tier: the agent tier's
+    # $tier is the agent name (up to 15 chars) which would overflow the
+    # log's 16-char STAGE column — `tools.agent` keeps it bounded and
+    # parallel to `tools.base`/`tools.tool`. $tier still names the archive
+    # prefix for the pin lookup below.
+    $stage = "tools.$($vars.kind)"
 
     # $ErrorActionPreference does NOT cover native command exit codes —
     # `tar` and friends keep going on non-zero. Wrap them so a failed
@@ -430,21 +332,41 @@ $buildToolArchives = {
       ,$files.ToArray()
     }
 
+    # sha256 of a string → lowercase hex. The job runspace doesn't inherit
+    # the parent's $sha256, so define a local one for the tier hash seeds.
+    $sha256 = {
+      [BitConverter]::ToString(
+        [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($args[0]))
+      ).Replace('-', '').ToLower()
+    }
+    # Substitute {arch}/{triple}/{version} in a template (agent urlSuffix /
+    # binPath). $vars carries arch/archTriple; $version is the resolved tag.
+    $subst = { param($t, $version)
+      $t.Replace('{arch}', $vars.arch).Replace('{triple}', $vars.archTriple).Replace('{version}', $version)
+    }
+
+    # Each tier is a self-contained pipeline (resolve own version → hash →
+    # cache-check → build → pack) and writes its resolved archive path to
+    # $pathOut for the parent — mirroring lib/tools.sh's per-tier subshells.
+    # Pinned: resolve by hash prefix, verify, done.
     if ($optHash) {
+      $cand = if ([IO.Directory]::Exists($toolsDir)) { [IO.Directory]::GetFiles($toolsDir, "$tier-$optHash*.tar.xz") } else { @() }
+      if (-not $cand -or $cand.Length -eq 0) {
+        Write-Log E $stage fail "no cached archive matching hash '$optHash'"
+        throw "no cached $tier archive matching hash '$optHash'"
+      }
+      if ($cand.Length -gt 1) {
+        Write-Log E $stage fail "ambiguous hash prefix '$optHash' matches multiple archives"
+        throw "ambiguous $tier hash prefix '$optHash'"
+      }
+      $archive = $cand[0]
       if (-not (& $archiveOk $archive)) {
         Write-Log E $stage fail "pinned archive is corrupt: $([IO.Path]::GetFileName($archive))"
         throw "pinned $tier archive is corrupt"
       }
       Write-Log I $stage cache-pin ([IO.Path]::GetFileName($archive))
+      [IO.File]::WriteAllText($pathOut, $archive)
       return
-    }
-    if ((-not $forcePull) -and (& $archiveOk $archive)) {
-      Write-Log I $stage cache-hit ([IO.Path]::GetFileName($archive))
-      return
-    }
-    if ([IO.File]::Exists($archive) -and -not $forcePull) {
-      Write-Log W $stage rebuild "cached archive corrupt; rebuilding"
-      [IO.File]::Delete($archive)
     }
 
     # Per-thread HttpClient — owned and disposed inside this runspace,
@@ -456,15 +378,58 @@ $buildToolArchives = {
     $tmpDir = [IO.Path]::Combine([IO.Path]::GetTempPath(), "agent-build-$([Guid]::NewGuid().ToString('N'))")
     [IO.Directory]::CreateDirectory($tmpDir) > $null
     try {
+      $archive = $null
       $packInputs = $null
       switch ($vars.kind) {
         'base' {
-          Write-Log I $stage downloading "node $($vars.nodeVer), ripgrep $($vars.rgVer), micro $($vars.microVer)"
-          $nodeTarballName = "node-v$($vars.nodeVer)-linux-$($vars.arch).tar.xz"
-          $nodeUrl = "https://nodejs.org/dist/v$($vars.nodeVer)/$nodeTarballName"
-          $nodeShaUrl = "https://nodejs.org/dist/v$($vars.nodeVer)/SHASUMS256.txt"
-          $rgUrl = "https://github.com/BurntSushi/ripgrep/releases/download/$($vars.rgVer)/ripgrep-$($vars.rgVer)-$($vars.archRg).tar.gz"
-          $microUrl = "https://github.com/micro-editor/micro/releases/download/v$($vars.microVer)/micro-$($vars.microVer)-$($vars.archMicro).tar.gz"
+          Write-Log I $stage resolving 'latest version'
+          # Resolve node (LTS) / ripgrep (crates max_stable) / micro
+          # (releases/latest redirect) versions in parallel, then hash.
+          $nodeVerT = $http.GetStringAsync('https://nodejs.org/dist/index.json')
+          $rgVerT = $http.GetStringAsync('https://crates.io/api/v1/crates/ripgrep')
+          $microVerReq = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Head, 'https://github.com/micro-editor/micro/releases/latest')
+          $microVerT = $http.SendAsync($microVerReq)
+          [Threading.Tasks.Task]::WaitAll($nodeVerT, $rgVerT, $microVerT)
+          $nodeIdx = [Text.Json.JsonDocument]::Parse($nodeVerT.Result)
+          $nodeVer = $null
+          foreach ($el in $nodeIdx.RootElement.EnumerateArray()) {
+            if ($el.GetProperty('lts').ValueKind -ne [Text.Json.JsonValueKind]::False) {
+              $nodeVer = $el.GetProperty('version').GetString().TrimStart('v'); break
+            }
+          }
+          $nodeIdx.Dispose()
+          $rgDoc = [Text.Json.JsonDocument]::Parse($rgVerT.Result)
+          $rgVer = $rgDoc.RootElement.GetProperty('crate').GetProperty('max_stable_version').GetString()
+          $rgDoc.Dispose()
+          $microFinal = $microVerT.Result.RequestMessage.RequestUri.ToString()
+          $microVerT.Result.Dispose()
+          $microVer = $microFinal.Substring($microFinal.LastIndexOf('/') + 1).TrimStart('v')
+          # micro guard — same as fetch_base_versions in lib/tools.sh: a
+          # failed/un-redirected releases/latest yields the literal tail.
+          if (-not $microVer -or $microVer -eq 'releases' -or $microVer -eq 'latest') {
+            Write-Log E $stage fail "failed to resolve a micro release tag (got '$microVer')"
+            throw "failed to resolve micro release tag"
+          }
+          if (-not $nodeVer -or -not $rgVer) {
+            Write-Log E $stage fail "failed to fetch node/ripgrep version"
+            throw "failed to fetch node/ripgrep version"
+          }
+          # arch:$arch in the seed because the packed binaries are
+          # architecture-specific — an x64/arm64 host sharing $toolsDir
+          # would otherwise collide on the same base-*.tar.xz filename.
+          $archive = "$toolsDir\base-$(& $sha256 "base-arch:$($vars.arch)-node:$nodeVer-rg:$rgVer-micro:$microVer").tar.xz"
+          if ((-not $forcePull) -and (& $archiveOk $archive)) {
+            Write-Log I $stage cache-hit ([IO.Path]::GetFileName($archive)); [IO.File]::WriteAllText($pathOut, $archive); return
+          }
+          if ([IO.File]::Exists($archive) -and -not $forcePull) {
+            Write-Log W $stage rebuild "cached archive corrupt; rebuilding"; [IO.File]::Delete($archive)
+          }
+          Write-Log I $stage downloading "node $nodeVer, ripgrep $rgVer, micro $microVer"
+          $nodeTarballName = "node-v$nodeVer-linux-$($vars.arch).tar.xz"
+          $nodeUrl = "https://nodejs.org/dist/v$nodeVer/$nodeTarballName"
+          $nodeShaUrl = "https://nodejs.org/dist/v$nodeVer/SHASUMS256.txt"
+          $rgUrl = "https://github.com/BurntSushi/ripgrep/releases/download/$rgVer/ripgrep-$rgVer-$($vars.archRg).tar.gz"
+          $microUrl = "https://github.com/micro-editor/micro/releases/download/v$microVer/micro-$microVer-$($vars.archMicro).tar.gz"
           # Fetch artifacts and publisher checksums in parallel. micro
           # uses '.sha' (not '.sha256') as its sidecar suffix.
           $nodeTask = $http.GetByteArrayAsync($nodeUrl)
@@ -483,36 +448,67 @@ $buildToolArchives = {
           & $verifySha256 $microTask.Result $microExp 'micro'
 
           $nodeTmp = "$tmpDir\_node.tar.xz"; [IO.File]::WriteAllBytes($nodeTmp, $nodeTask.Result)
-          & $mustNative tar -xJf $nodeTmp -C $tmpDir --strip-components=2 "node-v$($vars.nodeVer)-linux-$($vars.arch)/bin/node"
+          & $mustNative tar -xJf $nodeTmp -C $tmpDir --strip-components=2 "node-v$nodeVer-linux-$($vars.arch)/bin/node"
           [IO.File]::Delete($nodeTmp)
 
           $rgTmp = "$tmpDir\_rg.tar.gz"; [IO.File]::WriteAllBytes($rgTmp, $rgTask.Result)
-          & $mustNative tar -xzf $rgTmp -C $tmpDir --strip-components=1 "ripgrep-$($vars.rgVer)-$($vars.archRg)/rg"
+          & $mustNative tar -xzf $rgTmp -C $tmpDir --strip-components=1 "ripgrep-$rgVer-$($vars.archRg)/rg"
           [IO.File]::Delete($rgTmp)
 
           $microTmp = "$tmpDir\_micro.tar.gz"; [IO.File]::WriteAllBytes($microTmp, $microTask.Result)
-          & $mustNative tar -xzf $microTmp -C $tmpDir --strip-components=1 "micro-$($vars.microVer)/micro"
+          & $mustNative tar -xzf $microTmp -C $tmpDir --strip-components=1 "micro-$microVer/micro"
           [IO.File]::Delete($microTmp)
 
           $packInputs = @('node', 'rg', 'micro')
         }
         'tool' {
-          Write-Log I $stage downloading "pnpm $($vars.pnpmVer), uv $($vars.uvVer)"
+          Write-Log I $stage resolving 'latest version'
+          # Resolve pnpm (full `latest` metadata → version + tarball URL +
+          # sha512 SRI in one fetch) and uv (pypi version) in parallel,
+          # then hash. Mirrors fetch_tool_versions in lib/tools.sh.
+          $pnpmMetaT = $http.GetStringAsync('https://registry.npmjs.org/pnpm/latest')
+          $uvVerT = $http.GetStringAsync('https://pypi.org/pypi/uv/json')
+          [Threading.Tasks.Task]::WaitAll($pnpmMetaT, $uvVerT)
+          $pnpmDoc = [Text.Json.JsonDocument]::Parse($pnpmMetaT.Result)
+          $pnpmVer = $pnpmDoc.RootElement.GetProperty('version').GetString()
+          $pnpmDist = $pnpmDoc.RootElement.GetProperty('dist')
+          $pnpmTarballUrl = $pnpmDist.GetProperty('tarball').GetString()
+          $pnpmNpmIntegrity = $pnpmDist.GetProperty('integrity').GetString()
+          $pnpmDoc.Dispose()
+          $uvDoc = [Text.Json.JsonDocument]::Parse($uvVerT.Result)
+          $uvVer = $uvDoc.RootElement.GetProperty('info').GetProperty('version').GetString()
+          $uvDoc.Dispose()
+          if (-not $pnpmVer -or -not $uvVer) {
+            Write-Log E $stage fail "failed to fetch pnpm/uv version"; throw "failed to fetch pnpm/uv version"
+          }
+          if (-not $pnpmTarballUrl -or -not $pnpmNpmIntegrity) {
+            Write-Log E $stage fail "pnpm $pnpmVer`: missing dist.tarball / dist.integrity"; throw "pnpm npm metadata missing dist fields"
+          }
+          if (-not $pnpmTarballUrl.StartsWith('https://registry.npmjs.org/')) {
+            Write-Log E $stage fail "pnpm tarball URL not on registry.npmjs.org: $pnpmTarballUrl"; throw "pnpm tarball URL not on npm registry"
+          }
+          $archive = "$toolsDir\tool-$(& $sha256 "tool-arch:$($vars.arch)-pnpm:$pnpmVer-uv:$uvVer-shim:$($vars.shimTmpl)").tar.xz"
+          if ((-not $forcePull) -and (& $archiveOk $archive)) {
+            Write-Log I $stage cache-hit ([IO.Path]::GetFileName($archive)); [IO.File]::WriteAllText($pathOut, $archive); return
+          }
+          if ([IO.File]::Exists($archive) -and -not $forcePull) {
+            Write-Log W $stage rebuild "cached archive corrupt; rebuilding"; [IO.File]::Delete($archive)
+          }
+          Write-Log I $stage downloading "pnpm $pnpmVer, uv $uvVer"
           # pnpm vanilla npm package: a Node bundle (mjs entry, ~17 MB
           # unpacked) executed against the base-tier node via the same
           # shim template the agent tier uses for node-bundle agents.
           # Verified against npm's sha512 `dist.integrity` — same
           # trust path as the agent tier.
-          $pnpmUrl = $vars.pnpmTarballUrl
-          $uvUrl = "https://github.com/astral-sh/uv/releases/download/$($vars.uvVer)/uv-$($vars.archTriple).tar.gz"
-          $pnpmTask = $http.GetByteArrayAsync($pnpmUrl)
+          $uvUrl = "https://github.com/astral-sh/uv/releases/download/$uvVer/uv-$($vars.archTriple).tar.gz"
+          $pnpmTask = $http.GetByteArrayAsync($pnpmTarballUrl)
           $uvTask = $http.GetByteArrayAsync($uvUrl)
-          # uv ships a '<url>.sha256' sidecar; pnpm's integrity travels
-          # via $vars.pnpmNpmIntegrity (sha512 SRI) instead.
+          # uv ships a '<url>.sha256' sidecar; pnpm's integrity is the
+          # sha512 SRI from its npm metadata above.
           $uvShaTask = $http.GetStringAsync("$uvUrl.sha256")
           [Threading.Tasks.Task]::WaitAll($pnpmTask, $uvTask, $uvShaTask)
 
-          & $verifyNpmIntegrity $pnpmTask.Result $vars.pnpmNpmIntegrity 'pnpm npm tarball'
+          & $verifyNpmIntegrity $pnpmTask.Result $pnpmNpmIntegrity 'pnpm npm tarball'
           $uvExp = & $firstShaToken $uvShaTask.Result
           & $verifySha256 $uvTask.Result $uvExp 'uv'
 
@@ -545,48 +541,117 @@ $buildToolArchives = {
           $packInputs = @($pnpmShims) + @('pnpm-pkg', 'uv', 'uvx')
         }
         'agent' {
-          Write-Log I $stage downloading "$($vars.agentName) $($vars.agentVer) ($($vars.execType))"
+          Write-Log I $stage resolving 'latest version'
+          # Resolve the agent version, then (per source) the download URL +
+          # a verification reference, then hash → archive path → cache-check.
+          # Mirrors fetch_agent_version + _build_agent_tier in lib/tools.sh.
+          # The manifest is parsed parent-side (Agent.ps1 isn't loaded in
+          # this runspace); $vars carries the raw id/templates and the
+          # CR-stripped manifest/wrapper sources for the hash.
+          if ($vars.execSource -eq 'github') {
+            $verReq = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Head, "https://github.com/$($vars.execValue)/releases/latest")
+            $verRes = $http.SendAsync($verReq).Result
+            $verFinal = $verRes.RequestMessage.RequestUri.ToString(); $verRes.Dispose()
+            $agentVer = $verFinal.Substring($verFinal.LastIndexOf('/') + 1)
+            if (-not $agentVer -or $agentVer -eq 'releases' -or $agentVer -eq 'latest') {
+              Write-Log E $stage fail "failed to resolve a release tag for $($vars.execValue) (got '$agentVer')"
+              throw "failed to resolve release tag"
+            }
+          }
+          else {
+            $verDoc = [Text.Json.JsonDocument]::Parse($http.GetStringAsync("https://registry.npmjs.org/$($vars.execValue)/latest").Result)
+            $agentVer = $verDoc.RootElement.GetProperty('version').GetString(); $verDoc.Dispose()
+            if (-not $agentVer) { Write-Log E $stage fail "failed to fetch version for $($vars.execValue)"; throw "failed to fetch agent version" }
+          }
+          $suffix = & $subst $vars.urlSuffix $agentVer
+          $binPath = if ($vars.binPath) { & $subst $vars.binPath $agentVer } else { $null }
+          if ($vars.execSource -eq 'github') {
+            $url = "https://github.com/$($vars.execValue)/releases/download/$agentVer/$suffix"
+            $apiDoc = [Text.Json.JsonDocument]::Parse($http.GetStringAsync("https://api.github.com/repos/$($vars.execValue)/releases/tags/$agentVer").Result)
+            try {
+              $digest = $null
+              foreach ($a in $apiDoc.RootElement.GetProperty('assets').EnumerateArray()) {
+                if ($a.GetProperty('name').GetString() -eq $suffix) { $digest = $a.GetProperty('digest').GetString(); break }
+              }
+            }
+            finally { $apiDoc.Dispose() }
+            if (-not $digest -or -not $digest.StartsWith('sha256:')) {
+              Write-Log E $stage fail "no sha256 digest for asset '$suffix' in $($vars.execValue) $agentVer release metadata"
+              throw "no sha256 digest for $suffix"
+            }
+            $verifyMode = 'sha256'; $verifyRef = $digest.Substring('sha256:'.Length)
+          }
+          else {
+            $npmPath = "$($vars.execValue)$suffix"
+            $url = "https://registry.npmjs.org/$npmPath"
+            $npmSepIdx = $npmPath.IndexOf('/-/')
+            if ($npmSepIdx -lt 0) { Write-Log E $stage fail "npm <npm>+urlSuffix must form a '<pkg>/-/<file>.tgz' path: $npmPath"; throw "npm path missing /-/ separator" }
+            $npmPkg = $npmPath.Substring(0, $npmSepIdx)
+            $npmFilename = $npmPath.Substring($npmSepIdx + '/-/'.Length)
+            $npmPkgBase = $npmPkg.Substring($npmPkg.LastIndexOf('/') + 1)
+            $npmExpectedPrefix = "$npmPkgBase-"
+            if (-not $npmFilename.StartsWith($npmExpectedPrefix) -or -not $npmFilename.EndsWith('.tgz')) {
+              Write-Log E $stage fail "npm tarball filename does not match '<pkg>-<version>.tgz': $npmFilename (pkg=$npmPkgBase)"
+              throw "npm tarball filename shape mismatch: $npmFilename"
+            }
+            $npmTarVer = $npmFilename.Substring($npmExpectedPrefix.Length, $npmFilename.Length - $npmExpectedPrefix.Length - '.tgz'.Length)
+            $npmMetaDoc = [Text.Json.JsonDocument]::Parse($http.GetStringAsync("https://registry.npmjs.org/$npmPkg/$npmTarVer").Result)
+            try { $verifyRef = $npmMetaDoc.RootElement.GetProperty('dist').GetProperty('integrity').GetString() } finally { $npmMetaDoc.Dispose() }
+            if (-not $verifyRef) { Write-Log E $stage fail "no dist.integrity for $($vars.agentName)"; throw "no dist.integrity for $($vars.agentName)" }
+            $verifyMode = 'npm'
+          }
+          $archive = "$toolsDir\$($vars.agentName)-$(& $sha256 "agent:$($vars.agentName)-ver:$agentVer-arch:$($vars.arch)-manifest:$($vars.manifestSrc)-manifest-sh:$($vars.manifestShContents)-wrapper:$($vars.wrapperSrc)-shim:$($vars.shimTmpl)").tar.xz"
+          if ((-not $forcePull) -and (& $archiveOk $archive)) {
+            Write-Log I $stage cache-hit ([IO.Path]::GetFileName($archive)); [IO.File]::WriteAllText($pathOut, $archive); return
+          }
+          if ([IO.File]::Exists($archive) -and -not $forcePull) {
+            Write-Log W $stage rebuild "cached archive corrupt; rebuilding"; [IO.File]::Delete($archive)
+          }
+          $layout = if ($binPath) { 'platform-binary' } else { 'node-bundle' }
+          Write-Log I $stage downloading "$($vars.agentName) $agentVer ($layout)"
           $tarTmp = "$tmpDir\_agent.tgz"
           $extractDir = "$tmpDir\_extract"
           [IO.Directory]::CreateDirectory($extractDir) > $null
-          # Verify against npm dist.integrity (parent resolved this before
-          # spawning the job) before we hand the tarball to tar — same
+          # Verify the downloaded bytes before handing them to tar — same
           # threat model as the base/tool tier checksum gate.
-          $tarBytes = $http.GetByteArrayAsync($vars.tarballUrl).Result
-          & $verifyNpmIntegrity $tarBytes $vars.npmIntegrity "$($vars.agentName) npm tarball"
+          $tarBytes = $http.GetByteArrayAsync($url).Result
+          if ($verifyMode -eq 'sha256') {
+            & $verifySha256 $tarBytes $verifyRef "$($vars.agentName) github asset"
+          }
+          else {
+            & $verifyNpmIntegrity $tarBytes $verifyRef "$($vars.agentName) npm tarball"
+          }
           [IO.File]::WriteAllBytes($tarTmp, $tarBytes)
           & $mustNative tar -xzf $tarTmp -C $extractDir
           [IO.File]::Delete($tarTmp)
 
           $binary = $vars.agentBinary
-          switch ($vars.execType) {
-            'platform-binary' {
-              $binSrc = [IO.Path]::Combine($extractDir, $vars.binPath.Replace('/', [IO.Path]::DirectorySeparatorChar))
-              if (-not [IO.File]::Exists($binSrc)) {
-                Write-Log E $stage fail "binary not found in tarball: $($vars.binPath)"
-                throw "binary not found in tarball"
-              }
-              [IO.File]::Copy($binSrc, "$tmpDir\$binary-bin", $true)
-              $packInputs = @($binary, 'agent-manifest.sh', "$binary-bin")
+          # binPath presence is the layout discriminator: present ⇒ single
+          # platform binary at that archive path; absent ⇒ npm node bundle.
+          if ($binPath) {
+            $binSrc = [IO.Path]::Combine($extractDir, $binPath.Replace('/', [IO.Path]::DirectorySeparatorChar))
+            if (-not [IO.File]::Exists($binSrc)) {
+              Write-Log E $stage fail "binary not found in tarball: $binPath"
+              throw "binary not found in tarball"
             }
-            'node-bundle' {
-              $pkgSrc = [IO.Path]::Combine($extractDir, 'package')
-              if (-not [IO.Directory]::Exists($pkgSrc)) {
-                Write-Log E $stage fail "node bundle has no 'package/' dir"
-                throw "node bundle has no package/ dir"
-              }
-              $pkgName = "$binary-pkg"
-              [IO.Directory]::Move($pkgSrc, "$tmpDir\$pkgName")
-              # Render one shim per package.json `bin` entry. The
-              # canonical entry (key matching .binary) goes to
-              # "$binary-bin" so agent-wrapper.sh finds it; auxiliary
-              # entries become standalone shims under their bin keys.
-              # $agentShims holds the full list of rendered filenames
-              # (canonical + aux), spread into $packInputs below.
-              $agentShims = & $renderNodeBinShims $tmpDir "$tmpDir\$pkgName" $pkgName $vars.shimTmpl $binary "$binary-bin"
-              $packInputs = @($binary, 'agent-manifest.sh') + @($agentShims) + @($pkgName)
+            [IO.File]::Copy($binSrc, "$tmpDir\$binary-bin", $true)
+            $packInputs = @($binary, 'agent-manifest.sh', "$binary-bin")
+          }
+          else {
+            $pkgSrc = [IO.Path]::Combine($extractDir, 'package')
+            if (-not [IO.Directory]::Exists($pkgSrc)) {
+              Write-Log E $stage fail "node bundle has no 'package/' dir"
+              throw "node bundle has no package/ dir"
             }
-            default { throw "unknown executable.type: $($vars.execType)" }
+            $pkgName = "$binary-pkg"
+            [IO.Directory]::Move($pkgSrc, "$tmpDir\$pkgName")
+            # Render one shim per package.json `bin` entry. The canonical
+            # entry (key matching .binary) goes to "$binary-bin" so
+            # agent-wrapper.sh finds it; auxiliary entries become standalone
+            # shims under their bin keys. $agentShims holds the full list of
+            # rendered filenames (canonical + aux), spread into $packInputs.
+            $agentShims = & $renderNodeBinShims $tmpDir "$tmpDir\$pkgName" $pkgName $vars.shimTmpl $binary "$binary-bin"
+            $packInputs = @($binary, 'agent-manifest.sh') + @($agentShims) + @($pkgName)
           }
 
           # Wrapper goes in under the agent command name (regular file,
@@ -653,6 +718,7 @@ $buildToolArchives = {
       }
       [IO.File]::Move($tmp, $archive, $true)
       Write-Log I $stage cached ([IO.Path]::GetFileName($archive))
+      [IO.File]::WriteAllText($pathOut, $archive)
     }
     finally {
       $http.Dispose()
@@ -662,9 +728,7 @@ $buildToolArchives = {
 
   # ── Orchestration ──
 
-  try {
-
-    [IO.Directory]::CreateDirectory($toolsDir) > $null
+  [IO.Directory]::CreateDirectory($toolsDir) > $null
     # Reap ORPHAN partials from prior builds that crashed. The cache dir
     # is shared across concurrent launchers — a blanket delete would
     # race-delete another active launcher's in-progress archive (its
@@ -686,164 +750,78 @@ $buildToolArchives = {
       catch {}
     }
 
-    $needShared = (-not $optBaseHash) -or (-not $optToolHash)
-    $needAgent = -not $optAgentHash
-    if ($needShared -and -not $script:nodeVer) { . $fetchSharedVersions }
-    if ($needAgent -and -not $script:agentVer) { . $fetchAgentVersion }
-
-    # Archive path resolution.
-    if ($optBaseHash) {
-      $script:baseArchive = & $resolveArchive 'base' $optBaseHash
-    }
-    else {
-      # arch:$arch in the seed because the packed binaries (node, rg,
-      # micro) are architecture-specific. Without it, an x64 and an
-      # arm64 host sharing $toolsDir (a roaming-profile cache, an Apple
-      # Silicon dev switching between Rosetta and native, CI matrix
-      # with a shared build cache) collide on the same `base-*.tar.xz`
-      # filename and inject the wrong binaries. Matches the agent-tier
-      # seed below which already includes $arch.
-      $baseHash = & $sha256 "base-arch:$($script:arch)-node:$nodeVer-rg:$rgVer-micro:$microVer"
-      $script:baseArchive = "$toolsDir\base-$baseHash.tar.xz"
-    }
-    # Shim template bytes — both tool tier (pnpm) and agent tier
-    # (node-bundle agents) render this template, so changes to it must
-    # bust both tier caches AND must be passed into both thread-jobs
-    # for rendering. Loaded once on the parent side; $lfOnly collapses
-    # CRLF→LF so sh-side hashing matches regardless of the source
-    # file's on-disk line endings.
+    # Each tier is a fully independent pipeline (own version probes, hash,
+    # cache-check, build) run as a concurrent ThreadJob — no version-
+    # resolution barrier, mirroring lib/tools.sh's per-tier subshells. The
+    # job writes its resolved archive path to a temp file (the launcher
+    # consumes the three paths after this returns). The manifest is parsed
+    # HERE — Agent.ps1 isn't loaded in the job runspaces — so only no-
+    # network extraction happens parent-side; the job does version+network.
     $shimTmpl = & $lfOnly ([IO.File]::ReadAllText("$projectRoot\bin\node-shim.sh.tmpl"))
 
-    if ($optToolHash) {
-      $script:toolArchive = & $resolveArchive 'tool' $optToolHash
-    }
-    else {
-      # arch:$arch covers uv (per-arch native binary). pnpm is now JS,
-      # so its bytes are arch-agnostic — but the archive is shared
-      # with uv, so $arch stays in the seed. Include shim template
-      # since pnpm's `pnpm` entry is the rendered shim.
-      $toolHash = & $sha256 "tool-arch:$($script:arch)-pnpm:$pnpmVer-uv:$uvVer-shim:$shimTmpl"
-      $script:toolArchive = "$toolsDir\tool-$toolHash.tar.xz"
-    }
-    # Compute the generated agent-manifest.sh up front — used both in the
-    # tier-3 hash seed (so generator changes bust the cache) and passed to
-    # the ThreadJob below as the pack input.
-    $manifestShContents = & $agentManifestShContents
-
-    if ($optAgentHash) {
-      $script:agentArchive = & $resolveArchive $agent $optAgentHash
-    }
-    else {
-      # Include manifest source, generated agent-manifest.sh, and wrapper
-      # source in the hash.
-      $manifestSrc = & $lfOnly ([IO.File]::ReadAllText($agentManifestPath))
-      $wrapperSrc = & $lfOnly ([IO.File]::ReadAllText("$projectRoot\bin\agent-wrapper.sh"))
-      $agentHash = & $sha256 "agent:$agent-ver:$agentVer-arch:$arch-manifest:$manifestSrc-manifest-sh:$manifestShContents-wrapper:$wrapperSrc-shim:$shimTmpl"
-      $script:agentArchive = "$toolsDir\$agent-$agentHash.tar.xz"
-    }
-
     $baseVars = @{
-      kind = 'base'
-      userAgent = $crateUserAgent
-      nodeVer = $script:nodeVer; rgVer = $script:rgVer; microVer = $script:microVer
+      kind = 'base'; userAgent = $crateUserAgent
       arch = $script:arch; archRg = $script:archRg; archMicro = $script:archMicro
     }
     $toolVars = @{
-      kind = 'tool'
-      userAgent = $crateUserAgent
-      pnpmVer = $script:pnpmVer; uvVer = $script:uvVer
-      arch = $script:arch; archTriple = $script:archTriple
-      pnpmTarballUrl = $script:pnpmTarballUrl
-      pnpmNpmIntegrity = $script:pnpmNpmIntegrity
-      shimTmpl = $shimTmpl
+      kind = 'tool'; userAgent = $crateUserAgent
+      arch = $script:arch; archTriple = $script:archTriple; shimTmpl = $shimTmpl
     }
-    # Agent-tier inputs are only needed when the tier will actually
-    # build. When pinned (-AgentHash …), $tierBuilder verifies the
-    # cached archive and returns before reading $vars, so we skip the
-    # parsing, {version} substitution, and npm dist.integrity fetch
-    # entirely — otherwise pinned/offline launches throw on the
-    # network call below. Mirrors lib/tools.sh:_build_agent_tier,
-    # which gates the same prep behind OPT_AGENT_HASH.
+    $agentVars = @{
+      kind = 'agent'; userAgent = $crateUserAgent
+      agentName = $agent; agentBinary = $script:agentBinary
+      arch = $script:arch; archTriple = $script:archTriple; shimTmpl = $shimTmpl
+    }
+    # Agent inputs are only needed when the tier will actually build (a
+    # pinned tier resolves by hash prefix in the job and never reads these).
+    # Manifest parsing + urlSuffix validation happen here; the job resolves
+    # the version, builds the URL, fetches the digest/integrity, and hashes.
     if (-not $optAgentHash) {
-      $execType = Get-AgentField '.executable.type'
-      $tarballUrl = & $substTokens (Get-AgentField '.executable.tarballUrl') $script:agentVer
-      $binPath = Get-AgentField '.executable.binPath'
-      if ($binPath) { $binPath = & $substTokens $binPath $script:agentVer }
-      $wrapperSrcForPack = & $lfOnly ([IO.File]::ReadAllText("$projectRoot\bin\agent-wrapper.sh"))
+      & $resolveExecSource
+      $suffixRaw = Get-AgentField '.executable.urlSuffix'
+      if ($suffixRaw -notmatch '^[A-Za-z0-9._/{}-]+$' -or $suffixRaw -match '\.\.') {
+        Write-Log E "tools.$agent" fail "invalid executable.urlSuffix: '$suffixRaw' (chars [A-Za-z0-9._/{}-], no '..')"
+        throw "invalid executable.urlSuffix: $suffixRaw"
+      }
+      $agentVars.execSource = $script:execSource
+      $agentVars.execValue = $script:execValue
+      $agentVars.urlSuffix = $suffixRaw
+      $agentVars.binPath = Get-AgentField '.executable.binPath'
+      $agentVars.manifestShContents = & $agentManifestShContents
+      $agentVars.manifestSrc = & $lfOnly ([IO.File]::ReadAllText($agentManifestPath))
+      $agentVars.wrapperSrc = & $lfOnly ([IO.File]::ReadAllText("$projectRoot\bin\agent-wrapper.sh"))
+    }
 
-      # Resolve npm package name AND tarball-version from the URL. The
-      # version we look up MUST match the tarball we download — codex
-      # publishes per-platform binaries as version-suffixed releases
-      # ('0.125.0-linux-x64', '0.125.0-darwin-arm64', …) under the same
-      # '@openai/codex' package, so the integrity for '0.125.0' (the JS
-      # wrapper) is NOT the integrity for '0.125.0-linux-x64' (the
-      # platform binary we actually fetch). Extract the version from the
-      # tarball's basename instead of using $script:agentVer, which only
-      # knows the wrapper's version. URL shape:
-      # '<scope>/<name>/-/<basename>-<version>.tgz'. Restrict to
-      # registry.npmjs.org so a manifest can't redirect verification at
-      # an attacker-controlled metadata host.
-      if (-not $tarballUrl.StartsWith('https://registry.npmjs.org/')) {
-        Write-Log E "tools.$agent" fail "unsupported tarball host (only registry.npmjs.org is allowed): $tarballUrl"
-        throw "unsupported tarball host: $tarballUrl"
-      }
-      $npmRest = $tarballUrl.Substring('https://registry.npmjs.org/'.Length)
-      $npmSepIdx = $npmRest.IndexOf('/-/')
-      if ($npmSepIdx -lt 0) {
-        Write-Log E "tools.$agent" fail "tarball URL missing '/-/' separator: $tarballUrl"
-        throw "tarball URL missing /-/ separator"
-      }
-      $npmPkg = $npmRest.Substring(0, $npmSepIdx)
-      $npmFilename = $npmRest.Substring($npmSepIdx + '/-/'.Length)
-      $npmPkgBase = $npmPkg.Substring($npmPkg.LastIndexOf('/') + 1)
-      $npmExpectedPrefix = "$npmPkgBase-"
-      if (-not $npmFilename.StartsWith($npmExpectedPrefix) -or -not $npmFilename.EndsWith('.tgz')) {
-        Write-Log E "tools.$agent" fail "tarball filename does not match '<pkg>-<version>.tgz' shape: $npmFilename (pkg=$npmPkgBase)"
-        throw "tarball filename shape mismatch: $npmFilename"
-      }
-      $npmTarVer = $npmFilename.Substring($npmExpectedPrefix.Length, $npmFilename.Length - $npmExpectedPrefix.Length - '.tgz'.Length)
-      $npmMetaUrl = "https://registry.npmjs.org/$npmPkg/$npmTarVer"
-      $npmMetaJson = $http.GetStringAsync($npmMetaUrl).Result
-      $npmMetaDoc = [Text.Json.JsonDocument]::Parse($npmMetaJson)
-      try {
-        $npmIntegrity = $npmMetaDoc.RootElement.GetProperty('dist').GetProperty('integrity').GetString()
-      }
-      finally { $npmMetaDoc.Dispose() }
-      if (-not $npmIntegrity) {
-        Write-Log E "tools.$agent" fail "no dist.integrity at $npmMetaUrl"
-        throw "no dist.integrity for $agent"
-      }
-
-      $agentVars = @{
-        kind = 'agent'
-        userAgent = $crateUserAgent
-        agentName = $agent; agentBinary = $script:agentBinary
-        agentVer = $script:agentVer
-        execType = $execType
-        tarballUrl = $tarballUrl
-        binPath = $binPath
-        manifestShContents = $manifestShContents
-        wrapperSrc = $wrapperSrcForPack
-        shimTmpl = $shimTmpl
-        npmIntegrity = $npmIntegrity
+    $pd = [IO.Path]::Combine([IO.Path]::GetTempPath(), "crate-paths-$([Guid]::NewGuid().ToString('N'))")
+    [IO.Directory]::CreateDirectory($pd) > $null
+    try {
+      $basePath = [IO.Path]::Combine($pd, 'base')
+      $toolPath = [IO.Path]::Combine($pd, 'tool')
+      $agentPath = [IO.Path]::Combine($pd, 'agent')
+      $jobs = @(
+        Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
+          $script:LogLevel, $projectRoot, 'base', $toolsDir, $basePath, $optBaseHash, $forcePull, $baseVars
+        )
+        Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
+          $script:LogLevel, $projectRoot, 'tool', $toolsDir, $toolPath, $optToolHash, $forcePull, $toolVars
+        )
+        Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
+          $script:LogLevel, $projectRoot, $agent, $toolsDir, $agentPath, $optAgentHash, $forcePull, $agentVars
+        )
+      )
+      # Waits for all three (already running concurrently) and re-throws any
+      # job failure. Each job's only side effect we read is its path file;
+      # the output stream is intentionally ignored.
+      $jobs | Receive-Job -Wait -AutoRemoveJob | Out-Null
+      $script:baseArchive = [IO.File]::ReadAllText($basePath)
+      $script:toolArchive = [IO.File]::ReadAllText($toolPath)
+      $script:agentArchive = [IO.File]::ReadAllText($agentPath)
+      if (-not $script:baseArchive -or -not $script:toolArchive -or -not $script:agentArchive) {
+        Write-Log E tools fail "a tier pipeline did not report its archive path"
+        throw "a tier pipeline did not report its archive path"
       }
     }
-    else {
-      $agentVars = @{}
+    finally {
+      try { [IO.Directory]::Delete($pd, $true) } catch {}
     }
-    $jobs = @(
-      Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
-        $script:LogLevel, $projectRoot, 'base', $script:baseArchive, $optBaseHash, $forcePull, $baseVars
-      )
-      Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
-        $script:LogLevel, $projectRoot, 'tool', $script:toolArchive, $optToolHash, $forcePull, $toolVars
-      )
-      Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
-        $script:LogLevel, $projectRoot, $agent, $script:agentArchive, $optAgentHash, $forcePull, $agentVars
-      )
-    )
-    $jobs | Receive-Job -Wait -AutoRemoveJob
-
-  }
-  finally { $http.Dispose() }
 }
