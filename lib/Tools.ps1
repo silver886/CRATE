@@ -22,7 +22,7 @@ $cacheDir = if ($env:XDG_CACHE_HOME) { "$env:XDG_CACHE_HOME\crate" } else { "$HO
 #                    (linux64-static on X64, linux-arm64 on Arm64)
 #   $archRg      — ripgrep's triple — musl on X64, gnu on Arm64
 #                    (BurntSushi/ripgrep doesn't ship musl arm64)
-#   $archTriple  — full musl triple, used by uv and Codex {triple}
+#   $archTriple  — full musl triple, used by Codex {triple}
 $detectArch = {
   $osArch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture
   switch ($osArch) {
@@ -290,7 +290,7 @@ $buildToolArchives = {
           }
           foreach ($seg in $entry.Split('/')) {
             if ($seg -eq '' -or $seg -eq '.' -or $seg -eq '..' -or
-                $seg -notmatch '^[A-Za-z0-9._-]+$') {
+              $seg -notmatch '^[A-Za-z0-9._-]+$') {
               Write-Log E $stage fail "invalid bin path segment in $pkgJsonPath`: '$binPath' (segment '$seg' must match [A-Za-z0-9._-]+ and not be '.' or '..')"
               throw "$stage`: invalid bin path segment"
             }
@@ -305,9 +305,9 @@ $buildToolArchives = {
             # filenames. Tool tier (no $canonIn) skips this naturally.
             if ($canonIn) {
               if ($target -eq 'agent-manifest.sh' -or
-                  $target -eq $canonIn -or
-                  $target -eq $canonOut -or
-                  $target -eq "$canonIn-pkg") {
+                $target -eq $canonIn -or
+                $target -eq $canonOut -or
+                $target -eq "$canonIn-pkg") {
                 Write-Log E $stage fail "aux bin '$binName' collides with reserved filename '$target'"
                 throw "$stage`: aux bin '$binName' collides with reserved filename"
               }
@@ -329,7 +329,7 @@ $buildToolArchives = {
       }
       # Return as a fixed array — `,` prefix prevents PowerShell from
       # unwrapping a single-element list into a scalar.
-      ,$files.ToArray()
+      , $files.ToArray()
     }
 
     # sha256 of a string → lowercase hex. The job runspace doesn't inherit
@@ -477,6 +477,16 @@ $buildToolArchives = {
           $pnpmDoc.Dispose()
           $uvDoc = [Text.Json.JsonDocument]::Parse($uvVerT.Result)
           $uvVer = $uvDoc.RootElement.GetProperty('info').GetProperty('version').GetString()
+          $uvUrl = foreach ($a in $uvDoc.RootElement.GetProperty('urls').EnumerateArray()) {
+            $s = $a.GetProperty('filename').GetString()
+            $i = $s.IndexOf('musllinux', [StringComparison]::Ordinal)
+            if ($i -ge 0 -and $s.IndexOf($vars.archGnu, $i + 9, [StringComparison]::Ordinal) -ge 0) {
+              $a
+              break
+            }
+          }
+          $uvWhlUrl = $uvUrl.GetProperty('url').GetString()
+          $uvPypiIntegrity = $uvUrl.GetProperty('digests').GetProperty('sha256').GetString()
           $uvDoc.Dispose()
           if (-not $pnpmVer -or -not $uvVer) {
             Write-Log E $stage fail "failed to fetch pnpm/uv version"; throw "failed to fetch pnpm/uv version"
@@ -486,6 +496,12 @@ $buildToolArchives = {
           }
           if (-not $pnpmTarballUrl.StartsWith('https://registry.npmjs.org/')) {
             Write-Log E $stage fail "pnpm tarball URL not on registry.npmjs.org: $pnpmTarballUrl"; throw "pnpm tarball URL not on npm registry"
+          }
+          if (-not $uvWhlUrl -or -not $uvPypiIntegrity) {
+            Write-Log E $stage fail "uv $uvVer`: missing urls.url / urls.digests.sha256 where urls.filename matches 'musllinux*$($vars.archGnu)'"; throw "uv PyPI metadata missing urls fields"
+          }
+          if (-not $uvWhlUrl.StartsWith('https://files.pythonhosted.org/')) {
+            Write-Log E $stage fail "uv wheel URL not on files.pythonhosted.org: $uvWhlUrl"; throw "uv wheel URL not on PyPI registry"
           }
           $archive = "$toolsDir\tool-$(& $sha256 "tool-arch:$($vars.arch)-pnpm:$pnpmVer-uv:$uvVer-shim:$($vars.shimTmpl)").tar.xz"
           if ((-not $forcePull) -and (& $archiveOk $archive)) {
@@ -500,16 +516,12 @@ $buildToolArchives = {
           # shim template the agent tier uses for node-bundle agents.
           # Verified against npm's sha512 `dist.integrity` — same
           # trust path as the agent tier.
-          $uvUrl = "https://github.com/astral-sh/uv/releases/download/$uvVer/uv-$($vars.archTriple).tar.gz"
           $pnpmTask = $http.GetByteArrayAsync($pnpmTarballUrl)
-          $uvTask = $http.GetByteArrayAsync($uvUrl)
-          # uv ships a '<url>.sha256' sidecar; pnpm's integrity is the
-          # sha512 SRI from its npm metadata above.
-          $uvShaTask = $http.GetStringAsync("$uvUrl.sha256")
-          [Threading.Tasks.Task]::WaitAll($pnpmTask, $uvTask, $uvShaTask)
+          $uvTask = $http.GetByteArrayAsync($uvWhlUrl)
+          [Threading.Tasks.Task]::WaitAll($pnpmTask, $uvTask)
 
           & $verifyNpmIntegrity $pnpmTask.Result $pnpmNpmIntegrity 'pnpm npm tarball'
-          $uvExp = & $firstShaToken $uvShaTask.Result
+          $uvExp = & $firstShaToken $uvPypiIntegrity
           & $verifySha256 $uvTask.Result $uvExp 'uv'
 
           $pnpmTmp = "$tmpDir\_pnpm.tgz"; [IO.File]::WriteAllBytes($pnpmTmp, $pnpmTask.Result)
@@ -536,8 +548,19 @@ $buildToolArchives = {
           $pnpmShims = & $renderNodeBinShims $tmpDir "$tmpDir\pnpm-pkg" 'pnpm-pkg' $vars.shimTmpl '' ''
 
           $uvTmp = "$tmpDir\_uv.tar.gz"; [IO.File]::WriteAllBytes($uvTmp, $uvTask.Result)
-          & $mustNative tar -xzf $uvTmp -C $tmpDir --strip-components=1
+          $uvExtract = "$tmpDir\_uv_extract"
+          [IO.Directory]::CreateDirectory($uvExtract) > $null
+          & $mustNative tar -xzf $uvTmp -C $uvExtract
           [IO.File]::Delete($uvTmp)
+          $uvPkgSrc = "$uvExtract\uv-$uvVer.data\scripts"
+          if (-not [IO.Directory]::Exists($uvPkgSrc)) {
+            Write-Log E $stage fail "uv PyPI wheel missing 'uv-$uvVer.data/scripts/' dir"
+            throw "uv PyPI wheel missing 'uv-$uvVer.data/scripts/' dir"
+          }
+          # Relocate uv-$uvVer.data/scripts/ → / matching the on-disk layout
+          [IO.File]::Move("$uvPkgSrc\uv", "$tmpDir\uv")
+          [IO.File]::Move("$uvPkgSrc\uvx", "$tmpDir\uvx")
+          [IO.Directory]::Delete($uvExtract, $true)
           $packInputs = @($pnpmShims) + @('pnpm-pkg', 'uv', 'uvx')
         }
         'agent' {
@@ -729,99 +752,99 @@ $buildToolArchives = {
   # ── Orchestration ──
 
   [IO.Directory]::CreateDirectory($toolsDir) > $null
-    # Reap ORPHAN partials from prior builds that crashed. The cache dir
-    # is shared across concurrent launchers — a blanket delete would
-    # race-delete another active launcher's in-progress archive (its
-    # File.Move would then fail). Each launch's partial is uniquely
-    # named via Guid.NewGuid(); a successful build always consumes its
-    # own partial via File.Move. Anything older than the threshold is
-    # by definition abandoned, so age-gating cleanup never touches a
-    # live builder's file.
-    # GetFiles (not EnumerateFiles) so the file list is materialized up
-    # front — deleting during enumeration can invalidate the enumerator
-    # and skip entries on some filesystems.
-    $stalePartialCutoff = (Get-Date).AddHours(-1)
-    foreach ($stale in [IO.Directory]::GetFiles($toolsDir, '*.partial.*')) {
-      try {
-        if ([IO.FileInfo]::new($stale).LastWriteTime -lt $stalePartialCutoff) {
-          [IO.File]::Delete($stale)
-        }
-      }
-      catch {}
-    }
-
-    # Each tier is a fully independent pipeline (own version probes, hash,
-    # cache-check, build) run as a concurrent ThreadJob — no version-
-    # resolution barrier, mirroring lib/tools.sh's per-tier subshells. The
-    # job writes its resolved archive path to a temp file (the launcher
-    # consumes the three paths after this returns). The manifest is parsed
-    # HERE — Agent.ps1 isn't loaded in the job runspaces — so only no-
-    # network extraction happens parent-side; the job does version+network.
-    $shimTmpl = & $lfOnly ([IO.File]::ReadAllText("$projectRoot\bin\node-shim.sh.tmpl"))
-
-    $baseVars = @{
-      kind = 'base'; userAgent = $crateUserAgent
-      arch = $script:arch; archRg = $script:archRg; archMicro = $script:archMicro
-    }
-    $toolVars = @{
-      kind = 'tool'; userAgent = $crateUserAgent
-      arch = $script:arch; archTriple = $script:archTriple; shimTmpl = $shimTmpl
-    }
-    $agentVars = @{
-      kind = 'agent'; userAgent = $crateUserAgent
-      agentName = $agent; agentBinary = $script:agentBinary
-      arch = $script:arch; archTriple = $script:archTriple; shimTmpl = $shimTmpl
-    }
-    # Agent inputs are only needed when the tier will actually build (a
-    # pinned tier resolves by hash prefix in the job and never reads these).
-    # Manifest parsing + urlSuffix validation happen here; the job resolves
-    # the version, builds the URL, fetches the digest/integrity, and hashes.
-    if (-not $optAgentHash) {
-      & $resolveExecSource
-      $suffixRaw = Get-AgentField '.executable.urlSuffix'
-      if ($suffixRaw -notmatch '^[A-Za-z0-9._/{}-]+$' -or $suffixRaw -match '\.\.') {
-        Write-Log E "tools.$agent" fail "invalid executable.urlSuffix: '$suffixRaw' (chars [A-Za-z0-9._/{}-], no '..')"
-        throw "invalid executable.urlSuffix: $suffixRaw"
-      }
-      $agentVars.execSource = $script:execSource
-      $agentVars.execValue = $script:execValue
-      $agentVars.urlSuffix = $suffixRaw
-      $agentVars.binPath = Get-AgentField '.executable.binPath'
-      $agentVars.manifestShContents = & $agentManifestShContents
-      $agentVars.manifestSrc = & $lfOnly ([IO.File]::ReadAllText($agentManifestPath))
-      $agentVars.wrapperSrc = & $lfOnly ([IO.File]::ReadAllText("$projectRoot\bin\agent-wrapper.sh"))
-    }
-
-    $pd = [IO.Path]::Combine([IO.Path]::GetTempPath(), "crate-paths-$([Guid]::NewGuid().ToString('N'))")
-    [IO.Directory]::CreateDirectory($pd) > $null
+  # Reap ORPHAN partials from prior builds that crashed. The cache dir
+  # is shared across concurrent launchers — a blanket delete would
+  # race-delete another active launcher's in-progress archive (its
+  # File.Move would then fail). Each launch's partial is uniquely
+  # named via Guid.NewGuid(); a successful build always consumes its
+  # own partial via File.Move. Anything older than the threshold is
+  # by definition abandoned, so age-gating cleanup never touches a
+  # live builder's file.
+  # GetFiles (not EnumerateFiles) so the file list is materialized up
+  # front — deleting during enumeration can invalidate the enumerator
+  # and skip entries on some filesystems.
+  $stalePartialCutoff = (Get-Date).AddHours(-1)
+  foreach ($stale in [IO.Directory]::GetFiles($toolsDir, '*.partial.*')) {
     try {
-      $basePath = [IO.Path]::Combine($pd, 'base')
-      $toolPath = [IO.Path]::Combine($pd, 'tool')
-      $agentPath = [IO.Path]::Combine($pd, 'agent')
-      $jobs = @(
-        Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
-          $script:LogLevel, $projectRoot, 'base', $toolsDir, $basePath, $optBaseHash, $forcePull, $baseVars
-        )
-        Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
-          $script:LogLevel, $projectRoot, 'tool', $toolsDir, $toolPath, $optToolHash, $forcePull, $toolVars
-        )
-        Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
-          $script:LogLevel, $projectRoot, $agent, $toolsDir, $agentPath, $optAgentHash, $forcePull, $agentVars
-        )
-      )
-      # Waits for all three (already running concurrently) and re-throws any
-      # job failure. Each job's only side effect we read is its path file;
-      # the output stream is intentionally ignored.
-      $jobs | Receive-Job -Wait -AutoRemoveJob | Out-Null
-      $script:baseArchive = [IO.File]::ReadAllText($basePath)
-      $script:toolArchive = [IO.File]::ReadAllText($toolPath)
-      $script:agentArchive = [IO.File]::ReadAllText($agentPath)
-      if (-not $script:baseArchive -or -not $script:toolArchive -or -not $script:agentArchive) {
-        Write-Log E tools fail "a tier pipeline did not report its archive path"
-        throw "a tier pipeline did not report its archive path"
+      if ([IO.FileInfo]::new($stale).LastWriteTime -lt $stalePartialCutoff) {
+        [IO.File]::Delete($stale)
       }
     }
-    finally {
-      try { [IO.Directory]::Delete($pd, $true) } catch {}
+    catch {}
+  }
+
+  # Each tier is a fully independent pipeline (own version probes, hash,
+  # cache-check, build) run as a concurrent ThreadJob — no version-
+  # resolution barrier, mirroring lib/tools.sh's per-tier subshells. The
+  # job writes its resolved archive path to a temp file (the launcher
+  # consumes the three paths after this returns). The manifest is parsed
+  # HERE — Agent.ps1 isn't loaded in the job runspaces — so only no-
+  # network extraction happens parent-side; the job does version+network.
+  $shimTmpl = & $lfOnly ([IO.File]::ReadAllText("$projectRoot\bin\node-shim.sh.tmpl"))
+
+  $baseVars = @{
+    kind = 'base'; userAgent = $crateUserAgent
+    arch = $script:arch; archRg = $script:archRg; archMicro = $script:archMicro
+  }
+  $toolVars = @{
+    kind = 'tool'; userAgent = $crateUserAgent
+    arch = $script:arch; archGnu = $script:archGnu; shimTmpl = $shimTmpl
+  }
+  $agentVars = @{
+    kind = 'agent'; userAgent = $crateUserAgent
+    agentName = $agent; agentBinary = $script:agentBinary
+    arch = $script:arch; archTriple = $script:archTriple; shimTmpl = $shimTmpl
+  }
+  # Agent inputs are only needed when the tier will actually build (a
+  # pinned tier resolves by hash prefix in the job and never reads these).
+  # Manifest parsing + urlSuffix validation happen here; the job resolves
+  # the version, builds the URL, fetches the digest/integrity, and hashes.
+  if (-not $optAgentHash) {
+    & $resolveExecSource
+    $suffixRaw = Get-AgentField '.executable.urlSuffix'
+    if ($suffixRaw -notmatch '^[A-Za-z0-9._/{}-]+$' -or $suffixRaw -match '\.\.') {
+      Write-Log E "tools.$agent" fail "invalid executable.urlSuffix: '$suffixRaw' (chars [A-Za-z0-9._/{}-], no '..')"
+      throw "invalid executable.urlSuffix: $suffixRaw"
     }
+    $agentVars.execSource = $script:execSource
+    $agentVars.execValue = $script:execValue
+    $agentVars.urlSuffix = $suffixRaw
+    $agentVars.binPath = Get-AgentField '.executable.binPath'
+    $agentVars.manifestShContents = & $agentManifestShContents
+    $agentVars.manifestSrc = & $lfOnly ([IO.File]::ReadAllText($agentManifestPath))
+    $agentVars.wrapperSrc = & $lfOnly ([IO.File]::ReadAllText("$projectRoot\bin\agent-wrapper.sh"))
+  }
+
+  $pd = [IO.Path]::Combine([IO.Path]::GetTempPath(), "crate-paths-$([Guid]::NewGuid().ToString('N'))")
+  [IO.Directory]::CreateDirectory($pd) > $null
+  try {
+    $basePath = [IO.Path]::Combine($pd, 'base')
+    $toolPath = [IO.Path]::Combine($pd, 'tool')
+    $agentPath = [IO.Path]::Combine($pd, 'agent')
+    $jobs = @(
+      Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
+        $script:LogLevel, $projectRoot, 'base', $toolsDir, $basePath, $optBaseHash, $forcePull, $baseVars
+      )
+      Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
+        $script:LogLevel, $projectRoot, 'tool', $toolsDir, $toolPath, $optToolHash, $forcePull, $toolVars
+      )
+      Start-ThreadJob -ScriptBlock $tierBuilder -ArgumentList @(
+        $script:LogLevel, $projectRoot, $agent, $toolsDir, $agentPath, $optAgentHash, $forcePull, $agentVars
+      )
+    )
+    # Waits for all three (already running concurrently) and re-throws any
+    # job failure. Each job's only side effect we read is its path file;
+    # the output stream is intentionally ignored.
+    $jobs | Receive-Job -Wait -AutoRemoveJob | Out-Null
+    $script:baseArchive = [IO.File]::ReadAllText($basePath)
+    $script:toolArchive = [IO.File]::ReadAllText($toolPath)
+    $script:agentArchive = [IO.File]::ReadAllText($agentPath)
+    if (-not $script:baseArchive -or -not $script:toolArchive -or -not $script:agentArchive) {
+      Write-Log E tools fail "a tier pipeline did not report its archive path"
+      throw "a tier pipeline did not report its archive path"
+    }
+  }
+  finally {
+    try { [IO.Directory]::Delete($pd, $true) } catch {}
+  }
 }
