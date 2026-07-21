@@ -189,7 +189,7 @@ TOOLS_DIR="$CACHE_DIR/tools"
 #                    (linux64-static on amd64, linux-arm64 on arm64)
 #   ARCH_RG      — ripgrep's triple — musl on amd64, gnu on arm64
 #                    (BurntSushi/ripgrep doesn't ship musl arm64)
-#   ARCH_TRIPLE  — full musl triple, used by uv and Codex {triple}
+#   ARCH_TRIPLE  — full musl triple, used by Codex {triple}
 detect_arch() {
   _uname=$(uname -m)
   case "$_uname" in
@@ -260,9 +260,9 @@ fetch_base_versions() {
   fi
 }
 
-# Fetch tool-tier versions + pnpm metadata (pnpm, uv) in parallel.
-# Sets: PNPM_VER, UV_VER, PNPM_TARBALL_URL, PNPM_NPM_INTEGRITY. Called
-# inside the tool pipeline.
+# Fetch tool-tier versions + pnpm/uv metadata (pnpm, uv) in parallel.
+# Sets: PNPM_VER, UV_VER, PNPM_TARBALL_URL, PNPM_NPM_INTEGRITY,
+# UV_WHL_URL, UV_PYPI_INTEGRITY. Called inside the tool pipeline.
 fetch_tool_versions() {
   _DIR=$(mktemp -d)
   # pnpm: full `latest` metadata in one fetch — gets version, tarball
@@ -274,16 +274,41 @@ fetch_tool_versions() {
   (curl -fsSL -A "$CRATE_USER_AGENT" https://registry.npmjs.org/pnpm/latest \
     > "$_DIR/pnpm.json") &
   _PID1=$!
+  # Full PyPI metadata (not just .info.version): we also parse the
+  # matching musllinux wheel's download URL + sha256 digest out of the
+  # same ~4 MB response — one-fetch-many-fields, like pnpm above.
   (curl -fsSL -A "$CRATE_USER_AGENT" https://pypi.org/pypi/uv/json \
-    | jq -r .info.version > "$_DIR/uv") &
+    > "$_DIR/uv.json") &
   _PID2=$!
   wait_all "$_PID1" "$_PID2"
   _pnpm_meta=$(cat "$_DIR/pnpm.json")
-  UV_VER=$(cat "$_DIR/uv")
+  _uv_meta=$(cat "$_DIR/uv.json")
   rm -rf "$_DIR"
   PNPM_VER=$(printf '%s' "$_pnpm_meta" | jq -r '.version // empty')
   PNPM_TARBALL_URL=$(printf '%s' "$_pnpm_meta" | jq -r '.dist.tarball // empty')
   PNPM_NPM_INTEGRITY=$(printf '%s' "$_pnpm_meta" | jq -r '.dist.integrity // empty')
+  UV_VER=$(printf '%s' "$_uv_meta" | jq -r '.info.version // empty')
+  # Select the uv wheel whose filename contains 'musllinux' followed by
+  # this host's Rust-arch token ($ARCH_GNU, e.g. x86_64 / aarch64) — the
+  # musllinux wheel is statically linked, so it runs in the sandbox
+  # regardless of the host libc. `index` mirrors Tools.ps1's substring
+  # scan (find 'musllinux', then look for the arch after it, 9 = len
+  # 'musllinux'); `first` takes the earliest match. Emits the URL on the
+  # first line and the sha256 digest on the second.
+  {
+    IFS= read -r UV_WHL_URL
+    IFS= read -r UV_PYPI_INTEGRITY
+  } <<EOF
+$(printf '%s' "$_uv_meta" | jq -r --arg arch "$ARCH_GNU" '
+    [ .urls[]
+      | select(
+          (.filename | index("musllinux")) as $i
+          | $i != null and (.filename[$i + 9:] | index($arch)) != null
+        )
+    ]
+    | first
+    | (.url // ""), (.digests.sha256 // "")')
+EOF
   if [ -z "$PNPM_VER" ] || [ -z "$UV_VER" ]; then
     log E tools.tool fail "failed to fetch pnpm/uv version"
     exit 1
@@ -292,12 +317,23 @@ fetch_tool_versions() {
     log E tools.tool fail "pnpm $PNPM_VER: missing dist.tarball / dist.integrity"
     exit 1
   fi
+  if [ -z "$UV_WHL_URL" ] || [ -z "$UV_PYPI_INTEGRITY" ]; then
+    log E tools.tool fail "uv $UV_VER: missing urls.url / urls.digests.sha256 where urls.filename matches 'musllinux*$ARCH_GNU'"
+    exit 1
+  fi
   # Pinning the URL host to registry.npmjs.org matches the agent-tier
   # policy: a compromised metadata redirect can't point us at an
   # attacker host.
   case "$PNPM_TARBALL_URL" in
     https://registry.npmjs.org/*) ;;
     *) log E tools.tool fail "pnpm tarball URL not on registry.npmjs.org: $PNPM_TARBALL_URL"; exit 1 ;;
+  esac
+  # Same host-pinning policy for uv: PyPI serves wheel payloads off
+  # files.pythonhosted.org, so a tampered metadata URL can't redirect the
+  # download to an attacker-controlled host.
+  case "$UV_WHL_URL" in
+    https://files.pythonhosted.org/*) ;;
+    *) log E tools.tool fail "uv wheel URL not on files.pythonhosted.org: $UV_WHL_URL"; exit 1 ;;
   esac
 }
 
@@ -437,6 +473,26 @@ _pack_xz() {
       tar -C "$_pxz_dir" --xz -cf "$_pxz_out" "$@"
       ;;
   esac
+}
+
+# Extract a ZIP archive (e.g. a PyPI wheel) into DEST_DIR. GNU tar — a
+# supported `tar` on Linux per the README — cannot read zip, so prefer
+# `unzip`; fall back to a libarchive `tar` (bsdtar, the macOS/Windows
+# default, which auto-detects zip regardless of the format flags). Errors
+# if neither is available: the uv binaries live inside a wheel and
+# there's no way in with the rest of the required toolchain. Mirrors
+# Tools.ps1's `tar -xzf` on the wheel, where the platform tar is always
+# bsdtar. Args: ZIP_FILE  DEST_DIR
+_extract_zip() {
+  _ez_file=$1; _ez_dest=$2
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "$_ez_file" -d "$_ez_dest"
+  elif tar --version 2>&1 | head -1 | grep -qi bsdtar; then
+    tar -xf "$_ez_file" -C "$_ez_dest"
+  else
+    log E tools.tool fail "cannot extract wheel: need 'unzip' or a libarchive tar (GNU tar can't read zip archives)"
+    exit 1
+  fi
 }
 
 # ── Per-tier builders ──
@@ -581,13 +637,27 @@ _build_tool_tier() {
   ) &
   _PID1=$!
   (
-    _url="https://github.com/astral-sh/uv/releases/download/${UV_VER}/uv-${ARCH_TRIPLE}.tar.gz"
-    _file="$_DIR/_uv.tar.gz"
-    curl -fsSL -A "$CRATE_USER_AGENT" "$_url" -o "$_file"
-    _exp=$(curl -fsSL -A "$CRATE_USER_AGENT" "${_url}.sha256" | awk '{print $1; exit}')
-    _verify_sha256 "$_file" "$_exp" "uv"
-    tar -xz --strip-components=1 -C "$_DIR" -f "$_file"
+    # uv now ships from PyPI as a musllinux wheel (a ZIP), verified
+    # against PyPI's own sha256 digest — the same trust anchor as pnpm's
+    # npm integrity. (Formerly a GitHub release tarball + `.sha256`
+    # sidecar.) The wheel lays uv/uvx out under `uv-<ver>.data/scripts/`;
+    # relocate the two binaries to the archive root to match the on-disk
+    # layout the packer expects.
+    _file="$_DIR/_uv.whl"
+    curl -fsSL -A "$CRATE_USER_AGENT" "$UV_WHL_URL" -o "$_file"
+    _verify_sha256 "$_file" "$UV_PYPI_INTEGRITY" "uv"
+    _extract="$_DIR/_uv_extract"
+    mkdir -p "$_extract"
+    _extract_zip "$_file" "$_extract"
     rm -f "$_file"
+    _scripts="$_extract/uv-${UV_VER}.data/scripts"
+    if [ ! -d "$_scripts" ]; then
+      log E tools.tool fail "uv PyPI wheel missing 'uv-${UV_VER}.data/scripts/' dir"
+      exit 1
+    fi
+    mv "$_scripts/uv" "$_DIR/uv"
+    mv "$_scripts/uvx" "$_DIR/uvx"
+    rm -rf "$_extract"
   ) &
   _PID2=$!
   wait_all "$_PID1" "$_PID2"
