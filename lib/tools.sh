@@ -883,6 +883,45 @@ _build_agent_tier() {
     fi
     cp "$_src" "$_DIR/${_binary}-bin"
     chmod +x "$_DIR/${_binary}-bin"
+
+    # Optional extra helper binaries shipped alongside the main one (e.g.
+    # codex-code-mode-host, invoked by codex itself via a same-directory
+    # sibling lookup — never run directly by the user). Each is copied
+    # under its own basename, unrenamed and unwrapped, into the same
+    # output dir as ${_binary}-bin so both PATH lookup and sibling-exe-dir
+    # lookup resolve it. _agent_extra collects the rendered filenames for
+    # the pack step below.
+    _agent_extra=""
+    while IFS= read -r -d '' _af_raw; do
+      case "$_af_raw" in
+        ''|*[!A-Za-z0-9._/{}-]*|*..*)
+          log E tools.agent fail "invalid executable.additionalFiles entry: '$_af_raw' (chars [A-Za-z0-9._/{}-], no '..')"
+          exit 1
+          ;;
+      esac
+      _af_path=$(_subst "$_af_raw" "$AGENT_VER")
+      _af_src="$_EXTRACT/$_af_path"
+      if [ ! -f "$_af_src" ]; then
+        log E tools.agent fail "additional file not found in tarball: $_af_path"
+        exit 1
+      fi
+      _af_name=$(basename "$_af_path")
+      case "$_af_name" in
+        ''|*[!A-Za-z0-9._-]*|-*|.*)
+          log E tools.agent fail "invalid executable.additionalFiles basename: '$_af_name'"
+          exit 1
+          ;;
+      esac
+      case "$_af_name" in
+        agent-manifest.sh|"$_binary"|"${_binary}-bin")
+          log E tools.agent fail "executable.additionalFiles entry '$_af_name' collides with a reserved filename"
+          exit 1
+          ;;
+      esac
+      cp "$_af_src" "$_DIR/$_af_name"
+      chmod +x "$_DIR/$_af_name"
+      _agent_extra="$_agent_extra $_af_name"
+    done < <(agent_get_list_nul .executable.additionalFiles)
   else
     # node-bundle: relocate extract/package → <binary>-pkg/ for a stable
     # on-disk path (~/.local/lib/<binary>-pkg/) inside the sandbox, then
@@ -916,7 +955,9 @@ _build_agent_tier() {
   log I tools.agent packing "$(basename "$_arch")"
   _AGENT_TMP=$(mktemp "$_arch.partial.XXXXXXXX")
   if [ -n "$_binpath" ]; then
-    _pack_xz "$_AGENT_TMP" "$_DIR" "$_binary" agent-manifest.sh "${_binary}-bin"
+    # shellcheck disable=SC2086 -- $_agent_extra intentionally word-split;
+    # each entry validated against [A-Za-z0-9._-] above.
+    _pack_xz "$_AGENT_TMP" "$_DIR" "$_binary" agent-manifest.sh "${_binary}-bin" $_agent_extra
   else
     # shellcheck disable=SC2086 -- $_agent_shims intentionally word-split;
     # _render_node_bin_shims validates names against [A-Za-z0-9._-].

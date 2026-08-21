@@ -16,7 +16,8 @@
   "executable": {
     "npm":       "@openai/codex",
     "urlSuffix": "/-/codex-{version}-linux-{arch}.tgz",
-    "binPath":   "package/vendor/{triple}/bin/codex"
+    "binPath":   "package/vendor/{triple}/bin/codex",
+    "additionalFiles": ["package/vendor/{triple}/bin/codex-code-mode-host"]
   },
   "launch": {
     "flags": ["--dangerously-bypass-approvals-and-sandbox"],

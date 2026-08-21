@@ -659,6 +659,38 @@ $buildToolArchives = {
             }
             [IO.File]::Copy($binSrc, "$tmpDir\$binary-bin", $true)
             $packInputs = @($binary, 'agent-manifest.sh', "$binary-bin")
+
+            # Optional extra helper binaries shipped alongside the main one
+            # (e.g. codex-code-mode-host, invoked by codex itself via a
+            # same-directory sibling lookup — never run directly by the
+            # user). Copied under their own basename, unrenamed and
+            # unwrapped, into the same output dir as $binary-bin. Mirrors
+            # lib/tools.sh's additionalFiles handling; no chmod here since
+            # Windows has no exec bit — setup-tools.sh sets +x generically
+            # from the archive TOC when extracted in the Linux sandbox.
+            foreach ($afRaw in $vars.additionalFiles) {
+              if ($afRaw -notmatch '^[A-Za-z0-9._/{}-]+$' -or $afRaw -match '\.\.') {
+                Write-Log E $stage fail "invalid executable.additionalFiles entry: '$afRaw' (chars [A-Za-z0-9._/{}-], no '..')"
+                throw "invalid executable.additionalFiles entry: $afRaw"
+              }
+              $afPath = & $subst $afRaw $agentVer
+              $afSrc = [IO.Path]::Combine($extractDir, $afPath.Replace('/', [IO.Path]::DirectorySeparatorChar))
+              if (-not [IO.File]::Exists($afSrc)) {
+                Write-Log E $stage fail "additional file not found in tarball: $afPath"
+                throw "additional file not found in tarball: $afPath"
+              }
+              $afName = $afPath.Substring($afPath.LastIndexOf('/') + 1)
+              if ($afName -notmatch '^[A-Za-z0-9._-]+$' -or $afName.StartsWith('-') -or $afName.StartsWith('.')) {
+                Write-Log E $stage fail "invalid executable.additionalFiles basename: '$afName'"
+                throw "invalid executable.additionalFiles basename: $afName"
+              }
+              if ($afName -eq 'agent-manifest.sh' -or $afName -eq $binary -or $afName -eq "$binary-bin") {
+                Write-Log E $stage fail "executable.additionalFiles entry '$afName' collides with a reserved filename"
+                throw "executable.additionalFiles entry collides with reserved filename: $afName"
+              }
+              [IO.File]::Copy($afSrc, "$tmpDir\$afName", $true)
+              $packInputs += $afName
+            }
           }
           else {
             $pkgSrc = [IO.Path]::Combine($extractDir, 'package')
@@ -810,6 +842,7 @@ $buildToolArchives = {
     $agentVars.execValue = $script:execValue
     $agentVars.urlSuffix = $suffixRaw
     $agentVars.binPath = Get-AgentField '.executable.binPath'
+    $agentVars.additionalFiles = Get-AgentList '.executable.additionalFiles'
     $agentVars.manifestShContents = & $agentManifestShContents
     $agentVars.manifestSrc = & $lfOnly ([IO.File]::ReadAllText($agentManifestPath))
     $agentVars.wrapperSrc = & $lfOnly ([IO.File]::ReadAllText("$projectRoot\bin\agent-wrapper.sh"))
